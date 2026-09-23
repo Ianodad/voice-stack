@@ -37,7 +37,15 @@ Keep as a **side experiment, not the production brain:** Kyutai **Moshi** (`mosh
 
 ---
 
-## 3. Open conflict — STT choice (must resolve by benchmark)
+## 3. STT choice — RESOLVED by measurement 2026-09-23
+
+> **Resolved: stay on parakeet-mlx.** Measured GPU contention is **+16.7%** on STT (74.8ms isolated → 87.3ms immediately after LLM generation). Real, but nowhere near enough to justify the WhisperKit Swift/IPC complexity. Revisit only if a sustained-concurrent-load benchmark shows worse degradation. Full data: `docs/BENCHMARK.md`.
+>
+> Measured warm pipeline total: **729ms median** — inside the 650–800ms budget. Caveats in §3a below.
+
+The original analysis follows, kept for the reasoning trail.
+
+
 
 The two STT candidates pull in opposite directions, and this is the one decision the research could **not** settle:
 
@@ -56,6 +64,14 @@ The two STT candidates pull in opposite directions, and this is the one decision
 **Plan:** start with parakeet-mlx (integration cost is near zero), measure real end-to-end latency, and only pay the WhisperKit IPC cost if Parakeet's GPU contention with the LLM proves to be the bottleneck.
 
 ---
+
+## 3a. Two caveats the 729ms number hides
+
+1. **Warmup is mandatory.** Run 0 was catastrophically slower than runs 1–4 — MLX lazy compilation, measured, not estimated: Kokoro's first `generate()` ~3.6–4s vs ~0.09–0.2s warm; parakeet's first `transcribe()` ~1.7s vs ~0.07–0.09s warm. Pipeline total run 0 was **6.85s**. The app MUST fire a dummy inference through all three models at startup or the user's first sentence feels broken.
+
+2. **TTS did not stream.** `mlx-audio` returned `n_chunks: 1` — TTFA (0.209s) and total synthesis (0.218s) are effectively the same number because the test answer was one short sentence. **This does not scale**: a 4-sentence answer will block for roughly 4x that before any audio plays. The real build needs sentence-level chunking (split the LLM token stream on sentence boundaries, synthesize and play each independently) or a genuinely streaming TTS backend. Until then, treat the TTS figure as "short-utterance only".
+
+3. **Qwen3.6 defaults to thinking mode.** Must pass `enable_thinking=False` to `apply_chat_template`, or the token budget is spent on invisible `<think>` reasoning instead of the spoken answer. Applies to the whole Qwen3 series.
 
 ## 4. Licensing — commercial safety
 

@@ -3,3 +3,5 @@ models/
 __pycache__/
 *.pyc
 .DS_Store
+scripts/__pycache__/
+__pycache__/

@@ -1,0 +1,91 @@
+{
+  "timestamp": "2026-09-23T18:51:24+00:00",
+  "machine": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "python": "3.12.13",
+    "chip": "Apple M5 Pro",
+    "memory_gb": 64
+  },
+  "versions": {
+    "mlx": "0.32.2",
+    "mlx-lm": "0.31.3",
+    "mlx-audio": "0.5.5",
+    "parakeet-mlx": "0.5.2",
+    "torch": "2.14.0",
+    "psutil": "7.2.2",
+    "misaki": "0.9.4",
+    "silero-vad": "6.2.3",
+    "huggingface-hub": "1.32.0"
+  },
+  "models": {
+    "stt": "mlx-community/parakeet-tdt-0.6b-v3",
+    "llm": "mlx-community/Qwen3.6-35B-A3B-4bit",
+    "tts": "mlx-community/Kokoro-82M-bf16"
+  },
+  "errors": [],
+  "cold_load_seconds": {
+    "stt": 0.835062291007489,
+    "llm": 2.9910109999764245,
+    "tts": 0.3389584590040613
+  },
+  "stage_seconds": {
+    "stt": {
+      "median": 0.09308125000097789,
+      "min": 0.0895975419844035,
+      "max": 0.775204167002812
+    },
+    "llm_ttft": {
+      "median": 0.19981133300461806,
+      "min": 0.196991207980318,
+      "max": 1.9425159580132458
+    },
+    "llm_total": {
+      "median": 0.4164668330049608,
+      "min": 0.4150761670025531,
+      "max": 2.1610275830025785
+    },
+    "tts_ttfa": {
+      "median": 0.2102902920159977,
+      "min": 0.20879254100145772,
+      "max": 4.069659833010519
+    },
+    "tts_total": {
+      "median": 0.22008699999423698,
+      "min": 0.21823304099962115,
+      "max": 4.114824582997244
+    },
+    "pipeline_total": {
+      "median": 0.7292339580017142,
+      "min": 0.7248497499967925,
+      "max": 6.852507083007367
+    }
+  },
+  "n_successful_runs": 5,
+  "gpu_contention_ab": {
+    "stt_isolated": {
+      "median": 0.07478645798983052,
+      "min": 0.073892040993087,
+      "max": 0.09035295899957418
+    },
+    "stt_after_llm": {
+      "median": 0.08726837500580586,
+      "min": 0.08611050000763498,
+      "max": 0.08771891699871048
+    }
+  },
+  "ram_gb": {
+    "rss_before_model_load": 0.4,
+    "rss_after_model_load": 14.28,
+    "peak_rss_during_runs": 14.28,
+    "peak_mlx_gpu_memory": 23.08
+  },
+  "sample_transcript": "What is the weather like in Nairobi today?",
+  "sample_llm_response": "I cannot provide real-time weather data, so please check a local weather service for current conditions in Nairobi.",
+  "sample_tts_info": {
+    "n_chunks": 1,
+    "total_samples": 170400,
+    "sample_rate": 24000,
+    "ttfa": 0.20879254100145772,
+    "total": 0.21823304099962115
+  }
+}
