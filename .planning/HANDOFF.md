@@ -13,10 +13,11 @@ Done:
 - `.planning/PLAN.md` rev 1 written (T1 deps → T2 stt ∥ T3 tts → T4 main → T5 live test).
 
 In progress:
-- PLAN rev 2 locked (Fable applied). Sonnet executor running T1→T4.
+- T1–T4 built by Sonnet executor; `uv run voice-stack --check` PASS re-verified by Opus 14:59 (LLM TTFT warm 187ms, no orphan server).
+- Sonnet xhigh code review running.
 
 Remaining:
-1. Wait for executor report; verify checks myself.
+1. Triage review findings → fix via executor → commit.
 3. Dispatch Sonnet executors; Sonnet xhigh review; synthesis.
 4. Live test with mic (user must talk to it).
 
@@ -24,6 +25,6 @@ Open Flags:
 - Echo/self-hearing: may need headphones unless AEC exists.
 - No uncommitted code yet.
 
-Git State: branch feature/voice-loop-mvp; HEAD ecdc8da (plan committed); executor writing src/ + scripts/check_*.py, uncommitted.
+Git State: branch feature/voice-loop-mvp; HEAD 8feaebb (auto-backup); src/ + scripts/check_*.py partly uncommitted.
 
-Resume instruction: check git log + which check scripts exist; resume T1–T4 from first failing gate per PLAN.md rev 2, then Sonnet xhigh review.
+Resume instruction: if review findings not triaged, re-run Sonnet xhigh review of src/voice_stack/*.py; then T5 live test (user, headphones: `uv run voice-stack`).

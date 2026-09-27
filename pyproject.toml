@@ -15,7 +15,8 @@ dependencies = [
     "parakeet-mlx>=0.5.2",
     "psutil>=7.2.2",
     "silero-vad>=6.2.3",
-    "soundfile>=0.14.0",
+    "soundfile>=0.13.1,<0.14",
+    "pipecat-ai[local]==1.12.0",
 ]
 
 [project.scripts]
