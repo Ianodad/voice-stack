@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from mlx_audio.tts.utils import load_model
 from pipecat.frames.frames import Frame, TTSAudioRawFrame
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 
 
@@ -38,7 +39,17 @@ class MLXKokoroTTSService(TTSService):
         speed: float = 1.0,
         **kwargs,
     ):
-        super().__init__(push_start_frame=True, push_stop_frames=True, sample_rate=24000, **kwargs)
+        # language=None: multi-language switching goes through lang_code
+        # above, not the Language-enum-based settings field (see
+        # pipecat/services/settings.py -- None marks a store-mode field as
+        # unsupported rather than leaving it NOT_GIVEN).
+        super().__init__(
+            push_start_frame=True,
+            push_stop_frames=True,
+            sample_rate=24000,
+            settings=TTSSettings(model=model_id, voice=voice, language=None),
+            **kwargs,
+        )
         self._executor = executor
         self._voice = voice
         self._lang_code = lang_code

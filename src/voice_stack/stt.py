@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from parakeet_mlx import from_pretrained
 from pipecat.frames.frames import Frame, TranscriptionFrame
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.utils.time import time_now_iso8601
 
@@ -32,7 +33,10 @@ class ParakeetSTTService(SegmentedSTTService):
     """
 
     def __init__(self, *, model_id: str, executor: ThreadPoolExecutor, **kwargs):
-        super().__init__(**kwargs)
+        # language=None: parakeet-mlx auto-detects language, no per-call
+        # setting to expose (see pipecat/services/settings.py -- None marks
+        # a store-mode field as unsupported rather than leaving it NOT_GIVEN).
+        super().__init__(settings=STTSettings(model=model_id, language=None), **kwargs)
         self._executor = executor
         # Loaded on the shared MLX executor thread, not the caller's thread.
         self._model = executor.submit(from_pretrained, model_id).result()

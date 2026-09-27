@@ -22,6 +22,10 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+from pipecat.turns.empty_user_turn import (
+    DEFAULT_EMPTY_USER_TURN_INTERRUPTED_PROMPT as DEVELOPER_ROLE_RECOVERY_PROMPT,
+)
+from pipecat.turns.user_mute import AlwaysUserMuteStrategy
 from pipecat.workers.runner import WorkerRunner
 
 from voice_stack.llm_server import MLXLMServer
@@ -84,7 +88,29 @@ async def _llm_text_turn(llm: OpenAILLMService, user_text: str) -> tuple[str, fl
     return "".join(chunks), ttft
 
 
-async def async_main(check: bool) -> None:
+async def _llm_developer_role_turn(llm: OpenAILLMService, user_text: str) -> str | None:
+    """One turn through OpenAILLMService.run_inference() with a developer-role
+    message in context -- the same message shape Pipecat's own user
+    aggregator injects when the user interrupts the bot with no transcript
+    (see llm_response_universal.py's _maybe_recover_empty_user_turn).
+
+    Regression check for the developer-role bug: without
+    `llm.supports_developer_role = False`, the adapter sends role="developer"
+    verbatim, Qwen3.6's chat template raises "Unexpected message role.", and
+    mlx_lm.server 404s -- this drives the real OpenAILLMService + adapter
+    path (unlike _llm_text_turn's raw client call) so --check actually
+    exercises it.
+    """
+    context = LLMContext(
+        messages=[
+            {"role": "developer", "content": DEVELOPER_ROLE_RECOVERY_PROMPT},
+            {"role": "user", "content": user_text},
+        ]
+    )
+    return await llm.run_inference(context, max_tokens=MAX_TOKENS)
+
+
+async def async_main(check: bool, barge_in: bool) -> None:
     # One dedicated MLX thread for STT + TTS (see PLAN.md "Key design calls":
     # avoids two threads issuing Metal work on different streams).
     executor = ThreadPoolExecutor(max_workers=1)
@@ -112,14 +138,33 @@ async def async_main(check: bool) -> None:
             base_url=llm_server.base_url,
             api_key="not-needed",
             settings=OpenAILLMService.Settings(
-                model=LLM_MODEL_ID, extra={"extra_body": ENABLE_THINKING_EXTRA_BODY}
+                model=LLM_MODEL_ID,
+                system_instruction=SYSTEM_PROMPT,
+                extra={"extra_body": ENABLE_THINKING_EXTRA_BODY},
             ),
         )
+        # mlx_lm.server's Qwen3.6 chat template raises "Unexpected message
+        # role." on role="developer" (see chat_template.jinja); Pipecat's own
+        # user aggregator injects one on an empty interrupted turn. The base
+        # class defaults to assuming native "developer" role support, so
+        # override per-instance to make the adapter convert it to "user"
+        # before sending (base_llm.py:343).
+        llm.supports_developer_role = False
 
-        context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
+        # system_instruction above replaces the old initial "system" message
+        # in context (base_llm.py's system_instruction path was deprecated in
+        # 1.9.0 for the latter).
+        context = LLMContext()
         user_agg, assistant_agg = LLMContextAggregatorPair(
             context,
-            user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+            user_params=LLMUserAggregatorParams(
+                vad_analyzer=SileroVADAnalyzer(),
+                # No AEC (see PLAN.md): on speakers the bot hears itself and
+                # transcribes fragments of its own reply as user speech. Mute
+                # the mic while the bot is speaking by default; --barge-in
+                # (headphone use) drops this to keep interruptions live.
+                user_mute_strategies=[] if barge_in else [AlwaysUserMuteStrategy()],
+            ),
             # user_turn_strategies left at default -> LocalSmartTurnAnalyzerV3, on-device.
         )
 
@@ -171,15 +216,24 @@ async def async_main(check: bool) -> None:
             print(f"  reply={reply!r}")
             print(f"  LLM TTFT (warm) = {ttft_ms:.1f}ms" if ttft_ms is not None else "  LLM TTFT: N/A")
 
+            print("Check: sending a developer-role turn through OpenAILLMService.run_inference() ...")
+            dev_role_reply = await _llm_developer_role_turn(llm, CHECK_USER_TEXT)
+            print(f"  reply={dev_role_reply!r}")
+
             assert stt_frames, "STT warmup produced no TranscriptionFrame"
             assert tts_frames, "TTS warmup produced no TTSAudioRawFrame"
             assert ttft_ms is not None and ttft_ms < 400, f"LLM TTFT {ttft_ms}ms >= 400ms"
             assert "<think>" not in reply, f"reply contained <think>: {reply!r}"
+            assert dev_role_reply, "developer-role run_inference() turn produced no reply"
+            assert "<think>" not in dev_role_reply, (
+                f"developer-role reply contained <think>: {dev_role_reply!r}"
+            )
 
             print("\ncheck: PASS")
             return
 
-        print("Ready — speak (use headphones)")
+        mode = "barge-in enabled, use headphones" if barge_in else "mic muted while bot speaks"
+        print(f"Ready ({mode}) — speak")
         # handle_sigterm mirrors handle_sigint so `kill <pid>` during the live
         # pipeline run takes the same graceful WorkerRunner shutdown path as
         # Ctrl-C (see the module-level SIGTERM handler for the phases before
@@ -212,9 +266,17 @@ def main() -> None:
         action="store_true",
         help="Build and warm up the pipeline, run one timed LLM turn, and exit without opening the mic.",
     )
+    parser.add_argument(
+        "--barge-in",
+        action="store_true",
+        help=(
+            "Keep the mic live while the bot speaks, for headphone use. Without this flag "
+            "(default, for speakers with no AEC) the mic is muted while the bot speaks."
+        ),
+    )
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
-        asyncio.run(async_main(check=args.check))
+        asyncio.run(async_main(check=args.check, barge_in=args.barge_in))
     except KeyboardInterrupt:
         pass
