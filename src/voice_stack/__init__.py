@@ -180,6 +180,8 @@ async def async_main(check: bool, barge_in: bool) -> None:
             params=PipelineParams(
                 audio_in_sample_rate=16000, audio_out_sample_rate=24000, enable_metrics=True
             ),
+            # Local assistant waits indefinitely; default 300s idle timeout exits it.
+            idle_timeout_secs=None,
         )
 
         # --- Warmup: pay MLX's one-time first-call lazy-compile cost here,
