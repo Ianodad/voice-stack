@@ -7,6 +7,7 @@ See .planning/PLAN.md for the architecture and design rationale.
 
 import argparse
 import asyncio
+import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -179,12 +180,29 @@ async def async_main(check: bool) -> None:
             return
 
         print("Ready — speak (use headphones)")
-        runner = WorkerRunner(handle_sigint=True)
+        # handle_sigterm mirrors handle_sigint so `kill <pid>` during the live
+        # pipeline run takes the same graceful WorkerRunner shutdown path as
+        # Ctrl-C (see the module-level SIGTERM handler for the phases before
+        # this point, i.e. server startup/warmup/--check).
+        runner = WorkerRunner(handle_sigint=True, handle_sigterm=True)
         await runner.add_workers(worker)
         await runner.run()
     finally:
         llm_server.stop()
         executor.shutdown(wait=True)
+
+
+def _raise_keyboard_interrupt(signum, frame) -> None:
+    """Make SIGTERM take the same cleanup path as Ctrl-C (SIGINT).
+
+    Installed before anything starts so `kill <pid>` during server startup,
+    warmup, or --check still reaches async_main()'s `finally` (which stops
+    mlx_lm.server) instead of leaving the 20GB subprocess orphaned --
+    without this, SIGTERM has no handler here and skips that cleanup
+    entirely (start_new_session=True already takes it out of SIGINT's/our
+    process group's reach, so this is the only thing standing in for it).
+    """
+    raise KeyboardInterrupt
 
 
 def main() -> None:
@@ -195,6 +213,7 @@ def main() -> None:
         help="Build and warm up the pipeline, run one timed LLM turn, and exit without opening the mic.",
     )
     args = parser.parse_args()
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
         asyncio.run(async_main(check=args.check))
     except KeyboardInterrupt:

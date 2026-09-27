@@ -14,17 +14,17 @@ Done:
 
 In progress:
 - T1–T4 built by Sonnet executor; `uv run voice-stack --check` PASS re-verified by Opus 14:59 (LLM TTFT warm 187ms, no orphan server).
-- Sonnet xhigh code review running.
+- Sonnet xhigh review: SIGTERM-orphan blocker + stale-server message + TTS cancel comment fixed; SIGTERM cleanup re-verified by Opus (server 1→0).
+- Committed; ready for T5 live test.
 
 Remaining:
-1. Triage review findings → fix via executor → commit.
-3. Dispatch Sonnet executors; Sonnet xhigh review; synthesis.
-4. Live test with mic (user must talk to it).
+1. T5: user runs `uv run voice-stack` with headphones; record live latency in docs/BENCHMARK.md.
+2. Synthesis in PLAN.md; merge decision (feature branch → master only on user go).
 
 Open Flags:
 - Echo/self-hearing: may need headphones unless AEC exists.
-- No uncommitted code yet.
+- Known limits: SIGKILL/crash can still orphan mlx_lm.server (`pkill -f mlx_lm.server`); interrupted Kokoro sentence finishes on executor (~0.2s).
 
-Git State: branch feature/voice-loop-mvp; HEAD 8feaebb (auto-backup); src/ + scripts/check_*.py partly uncommitted.
+Git State: branch feature/voice-loop-mvp; see `git log -1` (MVP commit).
 
-Resume instruction: if review findings not triaged, re-run Sonnet xhigh review of src/voice_stack/*.py; then T5 live test (user, headphones: `uv run voice-stack`).
+Resume instruction: ask user for live-test results (latency feel, barge-in, false cutoffs); fix what breaks; then synthesis.

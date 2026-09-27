@@ -60,7 +60,8 @@ class MLXLMServer:
             if self._process.poll() is not None:
                 raise RuntimeError(
                     f"mlx_lm.server exited early (code={self._process.returncode}); "
-                    f"see {LOG_PATH}"
+                    f"see {LOG_PATH}. A stale mlx_lm.server may already be holding "
+                    f"port {self._port} -- try `pkill -f mlx_lm.server` and retry."
                 )
             try:
                 resp = httpx.get(url, timeout=2.0)
@@ -70,7 +71,11 @@ class MLXLMServer:
                 pass
             time.sleep(0.5)
         self.stop()
-        raise TimeoutError(f"mlx_lm.server did not become ready within {timeout}s; see {LOG_PATH}")
+        raise TimeoutError(
+            f"mlx_lm.server did not become ready within {timeout}s; see {LOG_PATH}. "
+            f"A stale mlx_lm.server may already be holding port {self._port} -- try "
+            f"`pkill -f mlx_lm.server` and retry."
+        )
 
     def stop(self, grace_period: float = 5.0) -> None:
         """Terminate the subprocess, escalating to kill after a grace period."""

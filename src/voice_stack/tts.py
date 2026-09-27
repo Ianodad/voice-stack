@@ -71,6 +71,11 @@ class MLXKokoroTTSService(TTSService):
             audio_int16 = (audio_np * 32767).astype(np.int16).tobytes()
             return audio_int16, result.sample_rate
 
+        # NOTE: cancelling this run_tts (e.g. on barge-in) does not stop a
+        # Kokoro call already running on the shared MLX executor thread --
+        # it runs to completion and the next job queues behind it (~0.2s
+        # warm, bounded by sentence-sized chunks). Accepted for MVP per
+        # PLAN.md "Key design calls".
         while True:
             chunk = await loop.run_in_executor(self._executor, _next_chunk)
             if chunk is None:
