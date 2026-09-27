@@ -15,7 +15,8 @@ Done:
 In progress:
 - T1–T4 built by Sonnet executor; `uv run voice-stack --check` PASS re-verified by Opus 14:59 (LLM TTFT warm 187ms, no orphan server).
 - Sonnet xhigh review: SIGTERM-orphan blocker + stale-server message + TTS cancel comment fixed; SIGTERM cleanup re-verified by Opus (server 1→0).
-- Committed; ready for T5 live test.
+- Committed d386acc.
+- T5 live run #1 (15:53) FAILED: (a) Pipecat injects role=developer on interruption → Qwen template raises 'Unexpected message role' → LLM dead; (b) speakers, no AEC → bot hears itself, interrupts itself, transcribes own speech. Executor fixing: supports_developer_role=False, --check now exercises Pipecat LLM path w/ developer msg, AlwaysUserMuteStrategy default + --barge-in flag.
 
 Remaining:
 1. T5: user runs `uv run voice-stack` with headphones; record live latency in docs/BENCHMARK.md.
@@ -27,4 +28,4 @@ Open Flags:
 
 Git State: branch feature/voice-loop-mvp; see `git log -1` (MVP commit).
 
-Resume instruction: ask user for live-test results (latency feel, barge-in, false cutoffs); fix what breaks; then synthesis.
+Resume instruction: verify executor fix (--check PASS), commit, then relaunch live test (default mute mode works on speakers; --barge-in needs headphones).
