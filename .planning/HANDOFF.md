@@ -27,6 +27,6 @@ Open Flags:
 - Echo/self-hearing: may need headphones unless AEC exists.
 - Known limits: SIGKILL/crash can still orphan mlx_lm.server (`pkill -f mlx_lm.server`); interrupted Kokoro sentence finishes on executor (~0.2s).
 
-Git State: branch feature/voice-loop-mvp; see `git log -1` (MVP commit).
+Git State: branch phase/web-ui (from feature/voice-loop-mvp); HEAD b29a876.
 
-Resume instruction: NEW PHASE in brainstorming — custom web UI (daily assistant; features: live transcript, orb+state, mute/push-to-talk, saved history that CONTINUES context on reopen). Architectural path: approaches → design sections → spec in docs/superpowers/specs/ → user approval → writing-plans.
+Resume instruction: web UI spec written + committed (b29a876, docs/superpowers/specs/2026-09-27-web-ui-design.md) on branch phase/web-ui. Waiting for USER review of the written spec. On approval → invoke superpowers:writing-plans (task 0 = WebRTC/RTVI verification gate).
