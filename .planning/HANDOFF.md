@@ -16,6 +16,7 @@ In progress:
 - T1–T4 built by Sonnet executor; `uv run voice-stack --check` PASS re-verified by Opus 14:59 (LLM TTFT warm 187ms, no orphan server).
 - Sonnet xhigh review: SIGTERM-orphan blocker + stale-server message + TTS cancel comment fixed; SIGTERM cleanup re-verified by Opus (server 1→0).
 - Committed d386acc.
+- T5 live run #3 (16:10) WORKED: 22 turns, clean transcripts, mute mode on speakers. LLM TTFB live mean 0.43s (n=22; vs 0.18s in --check). STT/TTS custom services emit no TTFB metrics (follow-up). Bot claimed to run on 'Google's servers' → system prompt needs identity. Log saved .planning/live-run-2026-09-27.log.
 - T5 live run #1 (15:53) FAILED: (a) Pipecat injects role=developer on interruption → Qwen template raises 'Unexpected message role' → LLM dead; (b) speakers, no AEC → bot hears itself, interrupts itself, transcribes own speech. Executor fixing: supports_developer_role=False, --check now exercises Pipecat LLM path w/ developer msg, AlwaysUserMuteStrategy default + --barge-in flag.
 
 Remaining:
@@ -28,4 +29,4 @@ Open Flags:
 
 Git State: branch feature/voice-loop-mvp; see `git log -1` (MVP commit).
 
-Resume instruction: verify executor fix (--check PASS), commit, then relaunch live test (default mute mode works on speakers; --barge-in needs headphones).
+Resume instruction: NEW PHASE in brainstorming — custom web UI (daily assistant; features: live transcript, orb+state, mute/push-to-talk, saved history that CONTINUES context on reopen). Architectural path: approaches → design sections → spec in docs/superpowers/specs/ → user approval → writing-plans.
