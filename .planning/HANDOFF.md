@@ -24,6 +24,6 @@ Open Flags:
 - Echo/self-hearing: may need headphones unless AEC exists.
 - No uncommitted code yet.
 
-Git State: branch feature/voice-loop-mvp; HEAD 457bda8 (auto-backup checkpoint); .planning/ files uncommitted.
+Git State: branch feature/voice-loop-mvp; HEAD ecdc8da (plan committed); executor writing src/ + scripts/check_*.py, uncommitted.
 
 Resume instruction: check git log + which check scripts exist; resume T1–T4 from first failing gate per PLAN.md rev 2, then Sonnet xhigh review.
