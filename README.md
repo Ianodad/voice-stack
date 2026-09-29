@@ -32,3 +32,7 @@ Frontend dev: `VOICE_STACK_DEV=1 uv run voice-stack web`, then `cd web && npm ru
 ## Status
 
 Live voice loop and web UI are working; see `docs/BENCHMARK.md` for latency numbers (warm pipeline ~0.73s in isolation, live LLM TTFB ~0.43s). Not yet covered: long-term memory across conversations, tool use, mobile layout, auth (localhost only by design).
+
+## License
+
+MIT — see `LICENSE`.
