@@ -30,6 +30,13 @@ let muted = false;
 let pttHeld = false;
 let activeId: string | null = null;
 let generation = 0;
+const botAudio = $<HTMLAudioElement>("bot-audio");
+let audioCtx: AudioContext | null = null;
+let analyser: AnalyserNode | null = null;
+let analyserBuf: Uint8Array<ArrayBuffer> | null = null;
+let analyserSrc: MediaStreamAudioSourceNode | null = null;
+let botLevel = 0;
+let levelRaf = 0;
 let thinkingTimer: number | undefined;
 const THINKING_TIMEOUT_MS = 8000;
 
@@ -157,7 +164,59 @@ async function refreshSidebar(): Promise<void> {
   }
 }
 
+function stopBotAudio(): void {
+  cancelAnimationFrame(levelRaf);
+  levelRaf = 0;
+  botLevel = 0;
+  botAudio.srcObject = null;
+  try {
+    analyserSrc?.disconnect();
+  } catch {
+    /* ignore */
+  }
+  analyserSrc = null;
+  analyser = null;
+  analyserBuf = null;
+  void audioCtx?.close().catch(() => {});
+  audioCtx = null;
+}
+
+function levelLoop(): void {
+  levelRaf = requestAnimationFrame(levelLoop);
+  if (!analyser || !analyserBuf) return;
+  analyser.getByteTimeDomainData(analyserBuf);
+  let sum = 0;
+  for (const v of analyserBuf) {
+    const d = (v - 128) / 128;
+    sum += d * d;
+  }
+  botLevel = Math.sqrt(sum / analyserBuf.length);
+  if (phase === "speaking") orb.setLevel(Math.min(1, botLevel * 4));
+}
+
+function attachBotAudio(track: MediaStreamTrack): void {
+  const stream = new MediaStream([track]);
+  botAudio.srcObject = stream;
+  botAudio.play().catch((e) => console.warn("bot audio play() rejected", e));
+  // The transport's own player is disabled, so onRemoteAudioLevel never fires:
+  // measure the remote stream ourselves.
+  try {
+    audioCtx ??= new AudioContext();
+    void audioCtx.resume();
+    analyserSrc?.disconnect();
+    analyserSrc = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyserBuf = new Uint8Array(new ArrayBuffer(analyser.fftSize));
+    analyserSrc.connect(analyser); // not connected to destination: <audio> plays it
+    if (!levelRaf) levelLoop();
+  } catch (e) {
+    console.warn("bot level analyser unavailable", e);
+  }
+}
+
 async function teardown(): Promise<void> {
+  stopBotAudio();
   const c = client;
   client = null;
   if (c) {
@@ -230,12 +289,18 @@ async function connect(id: string | null): Promise<void> {
         micProblem ??= micProblemNotice(ms.mic.reason, String(ms.mic.details ?? ""));
         if (conn === "live") failMic(gen);
       },
+      onTrackStarted: (track, participant) => {
+        if (gen === generation && !participant?.local && track.kind === "audio") attachBotAudio(track);
+      },
       onUserStartedSpeaking: () => setPhase(gen, "userSpeaking"),
       // Ignore out-of-order events: only leave the phase the event belongs to.
       onUserStoppedSpeaking: () => {
         if (phase === "userSpeaking") setPhase(gen, "thinking");
       },
-      onBotStartedSpeaking: () => setPhase(gen, "speaking"),
+      onBotStartedSpeaking: () => {
+        transcript.startBotTurn();
+        setPhase(gen, "speaking");
+      },
       onBotStoppedSpeaking: () => {
         if (phase === "speaking") setPhase(gen, "listening");
       },
@@ -272,6 +337,7 @@ async function connect(id: string | null): Promise<void> {
     return;
   }
   if (gen !== generation) return;
+  if ((conn as Conn) === "error") return; // onError fired during connect; keep the error state
   if (!micProblem && c.mediaState.mic.state === "error") {
     const m = c.mediaState.mic;
     micProblem = micProblemNotice(m.reason, String(m.details ?? ""));
@@ -375,6 +441,7 @@ function setMic(on: boolean): void {
 
 muteBtn.addEventListener("click", () => {
   if (conn !== "live") return;
+  muteBtn.blur(); // keep Space from re-clicking the button
   muted = !muted;
   pttHeld = false; // an in-flight Space hold must not re-mute on keyup
   setMic(!muted);
@@ -435,6 +502,10 @@ window.addEventListener("blur", releasePtt);
   orb: orb.getState(),
   activeId,
   muted,
+  botLevel,
+  audioPaused: botAudio.paused,
+  audioTrack: (botAudio.srcObject as MediaStream | null)?.getAudioTracks().map((t) => t.readyState) ?? null,
+  ctx: audioCtx?.state ?? null,
 });
 
 void refreshSidebar().then(render);

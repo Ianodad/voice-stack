@@ -8,7 +8,6 @@ See .planning/PLAN.md for the architecture and design rationale.
 import argparse
 import asyncio
 import signal
-import time
 
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 from pipecat.workers.runner import WorkerRunner

@@ -16,6 +16,11 @@ export class Transcript {
     this.botLine = null;
   }
 
+  /** A new bot turn begins: the next appendBot starts a fresh line. */
+  startBotTurn(): void {
+    this.botLine = null;
+  }
+
   addUser(text: string): void {
     this.botLine = null;
     this.line("user", text);

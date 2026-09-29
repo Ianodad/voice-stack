@@ -48,6 +48,7 @@ class SessionManager:
         self._lock = asyncio.Lock()
         self._current: _Session | None = None
         self._all_tasks: list[asyncio.Task] = []
+        self._bg: set[asyncio.Task] = set()  # strong refs to fire-and-forget cancels
 
     def live_workers(self) -> int:
         """Number of session tasks (ever started) that have not finished."""
@@ -95,7 +96,10 @@ class SessionManager:
             # No lock here: start() holds it while awaiting the old session,
             # and that session's own disconnect event lands in this handler.
             if self._current is session:
-                asyncio.create_task(self._cancel_session(session, "client disconnected"))
+                t = asyncio.create_task(self._cancel_session(session, "client disconnected"))
+                self._all_tasks.append(t)
+                self._bg.add(t)
+                t.add_done_callback(self._bg.discard)
 
         async def _run() -> None:
             try:
