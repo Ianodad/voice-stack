@@ -137,6 +137,8 @@ function micDeniedNotice(): HTMLElement {
   return wrap;
 }
 
+const MIC_STOPPED = "Microphone stopped (device changed or in use) \u2014 click Reconnect";
+
 function isMicDenied(e: unknown): boolean {
   const name = (e as { name?: string })?.name ?? "";
   const msg = String((e as { message?: string })?.message ?? e);
@@ -164,7 +166,61 @@ async function refreshSidebar(): Promise<void> {
   }
 }
 
+const soundBanner = $<HTMLButtonElement>("sound-banner");
+let botTrack: MediaStreamTrack | null = null;
+let analyserTrack: MediaStreamTrack | null = null;
+let soundCheckTimer: number | undefined;
+let localTrack: MediaStreamTrack | null = null;
+
+/** Log the full playback state so a silent browser can be diagnosed from the console. */
+function logAudio(tag: string): { blocked: boolean } {
+  const s = botAudio.srcObject as MediaStream | null;
+  const info = {
+    tag,
+    readyState: botAudio.readyState,
+    paused: botAudio.paused,
+    muted: botAudio.muted,
+    volume: botAudio.volume,
+    sinkId: (botAudio as HTMLAudioElement & { sinkId?: string }).sinkId ?? "n/a",
+    tracks: s?.getAudioTracks().map((t) => ({ enabled: t.enabled, muted: t.muted, readyState: t.readyState })) ?? null,
+    audioContext: audioCtx?.state ?? null,
+  };
+  console.log("[bot-audio]", JSON.stringify(info));
+  return { blocked: !!s && (botAudio.paused || botAudio.muted || botAudio.volume === 0) };
+}
+
+function checkSound(tag: string): void {
+  const { blocked } = logAudio(tag);
+  soundBanner.hidden = !(blocked && botAudio.srcObject);
+}
+
+function scheduleSoundCheck(tag: string, delay = 1200): void {
+  clearTimeout(soundCheckTimer);
+  soundCheckTimer = window.setTimeout(() => checkSound(tag), delay);
+}
+
+for (const ev of ["play", "pause", "volumechange", "ended", "stalled", "error"]) {
+  botAudio.addEventListener(ev, () => {
+    if (botAudio.srcObject) scheduleSoundCheck(`audio:${ev}`, 200);
+  });
+}
+
+soundBanner.addEventListener("click", () => {
+  botAudio.muted = false;
+  if (botAudio.volume === 0) botAudio.volume = 1;
+  void audioCtx?.resume().catch(() => {});
+  botAudio
+    .play()
+    .catch((e) => console.warn("bot audio play() rejected after click", e))
+    .finally(() => scheduleSoundCheck("banner-click", 300));
+});
+
 function stopBotAudio(): void {
+  clearTimeout(soundCheckTimer);
+  soundBanner.hidden = true;
+  botTrack = null;
+  analyserTrack?.stop();
+  analyserTrack = null;
   cancelAnimationFrame(levelRaf);
   levelRaf = 0;
   botLevel = 0;
@@ -195,16 +251,36 @@ function levelLoop(): void {
 }
 
 function attachBotAudio(track: MediaStreamTrack): void {
+  botTrack = track;
   const stream = new MediaStream([track]);
   botAudio.srcObject = stream;
-  botAudio.play().catch((e) => console.warn("bot audio play() rejected", e));
+  botAudio.muted = false;
+  for (const ev of ["mute", "unmute", "ended"] as const) {
+    track.addEventListener(ev, () => {
+      if (track === botTrack) scheduleSoundCheck(`track:${ev}`, 200);
+    });
+  }
+  logAudio("attach");
+  botAudio
+    .play()
+    .then(() => scheduleSoundCheck("play-resolved"))
+    .catch((e) => {
+      console.warn("bot audio play() rejected", e);
+      checkSound("play-rejected");
+      soundBanner.hidden = false;
+    });
   // The transport's own player is disabled, so onRemoteAudioLevel never fires:
-  // measure the remote stream ourselves.
+  // measure the remote stream ourselves. Purely optional and isolated: it uses a
+  // cloned track, is never connected to the destination, and any failure only
+  // costs the orb its level animation, never playback.
   try {
     audioCtx ??= new AudioContext();
-    void audioCtx.resume();
+    audioCtx.onstatechange = () => logAudio("audioctx-state");
+    void audioCtx.resume().catch(() => {});
     analyserSrc?.disconnect();
-    analyserSrc = audioCtx.createMediaStreamSource(stream);
+    analyserTrack?.stop();
+    analyserTrack = track.clone();
+    analyserSrc = audioCtx.createMediaStreamSource(new MediaStream([analyserTrack]));
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 1024;
     analyserBuf = new Uint8Array(new ArrayBuffer(analyser.fftSize));
@@ -254,6 +330,19 @@ async function connect(id: string | null): Promise<void> {
   render();
 
   let micProblem: string | HTMLElement | null = null;
+  const watchMic = (g: number, track: MediaStreamTrack) => {
+    localTrack = track;
+    track.addEventListener("ended", () => {
+      // The transport swaps the track when the default device changes; only
+      // report loss if no replacement local track appeared shortly after.
+      window.setTimeout(() => {
+        if (g === generation && localTrack === track && conn === "live") {
+          micProblem = MIC_STOPPED;
+          failMic(g);
+        }
+      }, 1500);
+    });
+  };
   const failMic = (g: number) => {
     if (g !== generation) return;
     conn = "error";
@@ -282,15 +371,26 @@ async function connect(id: string | null): Promise<void> {
       onDeviceError: (err) => {
         if (gen !== generation) return;
         micProblem = micProblemNotice(err.type, err.message);
-        if (conn === "live") failMic(gen);
+        if (conn === "live") {
+          micProblem = MIC_STOPPED;
+          failMic(gen);
+        }
       },
       onMediaStateChanged: (ms) => {
         if (gen !== generation || ms.mic.state !== "error") return;
         micProblem ??= micProblemNotice(ms.mic.reason, String(ms.mic.details ?? ""));
-        if (conn === "live") failMic(gen);
+        if (conn === "live") {
+          micProblem = MIC_STOPPED;
+          failMic(gen);
+        }
       },
       onTrackStarted: (track, participant) => {
-        if (gen === generation && !participant?.local && track.kind === "audio") attachBotAudio(track);
+        if (gen !== generation || track.kind !== "audio") return;
+        if (participant?.local) {
+          watchMic(gen, track);
+        } else {
+          attachBotAudio(track);
+        }
       },
       onUserStartedSpeaking: () => setPhase(gen, "userSpeaking"),
       // Ignore out-of-order events: only leave the phase the event belongs to.
@@ -510,3 +610,51 @@ window.addEventListener("blur", releasePtt);
 
 void refreshSidebar().then(render);
 render();
+
+// ---------- speaker test ----------
+
+function beepWavUrl(): string {
+  const rate = 24000;
+  const n = Math.floor(rate * 0.4);
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const str = (o: number, s: string) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  str(0, "RIFF");
+  v.setUint32(4, 36 + n * 2, true);
+  str(8, "WAVEfmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  str(36, "data");
+  v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const fade = Math.min(1, i / 400, (n - i) / 400); // avoid clicks
+    v.setInt16(44 + i * 2, Math.sin((2 * Math.PI * 440 * i) / rate) * 0.4 * fade * 32767, true);
+  }
+  return URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+}
+
+const beepNote = $("beep-note");
+$("beep-btn").addEventListener("click", (ev) => {
+  (ev.currentTarget as HTMLButtonElement).blur();
+  const url = beepWavUrl();
+  const a = new Audio(url); // same media-element output path as the bot voice
+  a.volume = 1;
+  beepNote.hidden = false;
+  a.addEventListener("ended", () => URL.revokeObjectURL(url));
+  a.play().then(
+    () => {
+      beepNote.textContent =
+        "If you heard the beep, your speaker works — if not, check the output device and volume.";
+    },
+    (e) => {
+      URL.revokeObjectURL(url);
+      console.warn("beep play() rejected", e);
+      beepNote.textContent = `The browser blocked playback (${(e as Error).name}). Click Test speaker again or check site sound settings.`;
+    },
+  );
+});

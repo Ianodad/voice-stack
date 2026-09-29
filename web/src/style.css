@@ -88,6 +88,12 @@ body {
   padding: 12px 24px 16px; border-top: 1px solid var(--border);
 }
 .hint { margin-left: 12px; }
+.banner {
+  margin-top: 12px; padding: 8px 14px; border-radius: 8px; cursor: pointer; font: inherit; font-size: 14px;
+  background: var(--panel); color: var(--text); border: 1px solid var(--orb-bot);
+}
+.banner:hover { background: var(--btn-hover); }
+.beep-note { text-align: center; margin: 0; padding: 4px 24px; }
 .muted { color: var(--text-dim); }
 .small-text { font-size: 12px; }
 .sidebar .small-text { padding: 0 16px; }
