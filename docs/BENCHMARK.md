@@ -73,3 +73,10 @@ Delta: +16.7% median STT latency when run right after LLM generation.
 - Transcript: 'What is the weather like in Nairobi today?'
 - LLM response: 'I cannot provide real-time weather data, so please check a local weather service for current conditions in Nairobi.'
 - TTS info: {'n_chunks': 1, 'total_samples': 170400, 'sample_rate': 24000, 'ttfa': 0.20879254100145772, 'total': 0.21823304099962115}
+
+## Live loop (Pipecat, real mic/speakers) — 2026-09-27 run #3
+
+- 22 user turns, clean transcripts, mute-while-bot-speaks mode (speakers, no AEC).
+- LLM TTFB live: mean 0.43s (n=22) vs 0.19s in `--check` — longer context + real turn load.
+- STT/TTS custom services emit no TTFB metrics yet (follow-up).
+- Gap found: bot claimed to run on "Google's servers" → system prompt now states local/on-device identity (2026-09-29; `--check` PASS).

@@ -48,7 +48,13 @@ LLM_PORT = 8080
 # (same reasoning as scripts/latency_spike.py's run_llm).
 ENABLE_THINKING_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 
-SYSTEM_PROMPT = "You are a concise voice assistant. Reply in 1-3 short sentences, no markdown."
+SYSTEM_PROMPT = (
+    "You are a concise voice assistant running entirely locally on the user's Mac "
+    "(Apple Silicon): speech-to-text, this language model (Qwen3.6), and text-to-speech "
+    "all run on-device, with no internet or cloud access. You cannot open apps or browse. "
+    "Speech transcripts may contain mishearings; if a request is unclear, ask briefly. "
+    "Reply in 1-3 short sentences, no markdown."
+)
 WARMUP_USER_TEXT = "Say hello in one short sentence."
 CHECK_USER_TEXT = "What is two plus two?"
 MAX_TOKENS = 60
