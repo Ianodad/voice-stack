@@ -2,6 +2,10 @@
 
 Fully local voice assistant for Apple Silicon: parakeet-mlx (STT) → Qwen3.6 via mlx-lm (LLM) → Kokoro via mlx-audio (TTS), orchestrated by Pipecat. Nothing leaves the machine after setup.
 
+## Requirements
+
+Apple Silicon Mac with ~24 GB+ free unified memory (Qwen3.6-35B-A3B-4bit peaks near 23 GB GPU), Python 3.12+, [uv](https://docs.astral.sh/uv/), Node 20+ (web UI build). Models download from Hugging Face on first run, then everything runs offline.
+
 ## Run
 
 ```bash
@@ -24,3 +28,7 @@ Frontend dev: `VOICE_STACK_DEV=1 uv run voice-stack web`, then `cd web && npm ru
 - If a run is killed with SIGKILL, clean up with `pkill -f mlx_lm.server`.
 - Checks: `scripts/check_history.py`, `scripts/check_web.py`, `scripts/check_stt.py`, `scripts/check_tts.py`.
 - Design: `docs/superpowers/specs/2026-09-27-web-ui-design.md`; plan: `docs/superpowers/plans/2026-09-29-web-ui.md`; benchmarks: `docs/BENCHMARK.md`.
+
+## Status
+
+Live voice loop and web UI are working; see `docs/BENCHMARK.md` for latency numbers (warm pipeline ~0.73s in isolation, live LLM TTFB ~0.43s). Not yet covered: long-term memory across conversations, tool use, mobile layout, auth (localhost only by design).
