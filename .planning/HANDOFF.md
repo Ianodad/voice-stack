@@ -29,4 +29,4 @@ Open Flags:
 
 Git State: branch phase/web-ui (from feature/voice-loop-mvp); HEAD b29a876.
 
-Resume instruction: web UI spec written + committed (b29a876, docs/superpowers/specs/2026-09-27-web-ui-design.md) on branch phase/web-ui. Waiting for USER review of the written spec. On approval → invoke superpowers:writing-plans (task 0 = WebRTC/RTVI verification gate).
+Resume instruction: plan written docs/superpowers/plans/2026-09-29-web-ui.md (task-0 gate PASSED: WebRTC viable). Awaiting user review + execution method choice, then execute Task 1.
