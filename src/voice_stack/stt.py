@@ -32,14 +32,17 @@ class ParakeetSTTService(SegmentedSTTService):
     NamedTemporaryFile before calling model.transcribe().
     """
 
-    def __init__(self, *, model_id: str, executor: ThreadPoolExecutor, **kwargs):
+    def __init__(
+        self, *, model_id: str, executor: ThreadPoolExecutor, model=None, **kwargs
+    ):
         # language=None: parakeet-mlx auto-detects language, no per-call
         # setting to expose (see pipecat/services/settings.py -- None marks
         # a store-mode field as unsupported rather than leaving it NOT_GIVEN).
         super().__init__(settings=STTSettings(model=model_id, language=None), **kwargs)
         self._executor = executor
-        # Loaded on the shared MLX executor thread, not the caller's thread.
-        self._model = executor.submit(from_pretrained, model_id).result()
+        # A preloaded `model` skips loading. Otherwise it is loaded on the
+        # shared MLX executor thread, not the caller's thread.
+        self._model = model if model is not None else executor.submit(from_pretrained, model_id).result()
 
     def can_generate_metrics(self) -> bool:
         # Base class gates TTFB/processing metrics on this; default is False.

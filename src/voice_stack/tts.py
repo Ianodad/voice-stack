@@ -37,6 +37,7 @@ class MLXKokoroTTSService(TTSService):
         voice: str = "af_heart",
         lang_code: str = "a",
         speed: float = 1.0,
+        model=None,
         **kwargs,
     ):
         # language=None: multi-language switching goes through lang_code
@@ -54,8 +55,9 @@ class MLXKokoroTTSService(TTSService):
         self._voice = voice
         self._lang_code = lang_code
         self._speed = speed
-        # Loaded on the shared MLX executor thread, not the caller's thread.
-        self._model = executor.submit(load_model, model_id).result()
+        # A preloaded `model` skips loading. Otherwise it is loaded on the
+        # shared MLX executor thread, not the caller's thread.
+        self._model = model if model is not None else executor.submit(load_model, model_id).result()
 
     def can_generate_metrics(self) -> bool:
         # Base class gates TTFB/processing metrics on this; default is False.
