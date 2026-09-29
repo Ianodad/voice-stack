@@ -189,6 +189,8 @@ async def main() -> None:
                 print(f"offer #1: answer ok, ICE connected, conversation={c1.conversation_id}")
 
                 # --- offer #2 replaces #1: exactly one live worker ---
+                # (an empty conversation is pruned when its session ends, so give it a turn)
+                history.append(c1.conversation_id, "user", "hello there")
                 c2 = Client(base, http, None)
                 await c2.offer(f"?conversation_id={c1.conversation_id}")
                 await asyncio.wait_for(c2.connected.wait(), 20)
@@ -256,6 +258,32 @@ async def main() -> None:
                 assert sessions.live_workers() == 0, "restart left a live worker (live session)"
                 await c3.close()
                 print(f"llm restart WITH live session: ok (worst concurrent GET latency {worst*1000:.0f}ms)")
+
+                # --- empty conversations are pruned; ones with messages are kept ---
+                async def wait_no_workers():
+                    for _ in range(100):
+                        if sessions.live_workers() == 0:
+                            return
+                        await asyncio.sleep(0.1)
+                    raise AssertionError("session did not end")
+
+                kept = history.create()
+                history.append(kept, "user", "keep me")
+                c4 = Client(base, http, None)
+                await c4.offer()
+                await asyncio.wait_for(c4.connected.wait(), 20)
+                live_cid = c4.conversation_id
+                assert live_cid in {c["id"] for c in history.list()}, "live conversation missing"
+                await c4.close()
+                await asyncio.sleep(0.5)
+                await sessions.stop()
+                await wait_no_workers()
+                ids = {c["id"] for c in history.list()}
+                assert live_cid not in ids, "empty conversation left behind after disconnect"
+                assert kept in ids, "conversation with messages was pruned"
+                empties = [c for c in history.list() if not history.get(c["id"])]
+                assert not empties, f"empty rows remain: {empties}"
+                print("empty conversation pruned, non-empty kept: ok")
 
             # --- MLXLMServer: stop() then start() must not spawn (M1) ---
             import subprocess

@@ -30,6 +30,8 @@ let muted = false;
 let pttHeld = false;
 let activeId: string | null = null;
 let generation = 0;
+let thinkingTimer: number | undefined;
+const THINKING_TIMEOUT_MS = 8000;
 
 const sidebar = new Sidebar($("conv-list"), $("conv-empty"), {
   onSelect: (id) => void connect(id),
@@ -134,8 +136,15 @@ function isMicDenied(e: unknown): boolean {
   return (
     name === "NotAllowedError" ||
     name === "PermissionDeniedError" ||
-    /permission|not allowed|denied|getUserMedia/i.test(msg)
+    /(microphone|getUserMedia).*(denied|not allowed|permission)|permission.*(microphone|getUserMedia)/i.test(msg)
   );
+}
+
+// client-js/transport swallow getUserMedia failures (connect() still resolves),
+// so mic problems arrive via onDeviceError / mediaState instead of a rejection.
+function micProblemNotice(kind: string, detail: string): string | HTMLElement {
+  if (kind === "permissions" || kind === "blocked") return micDeniedNotice();
+  return `Microphone problem (${kind}): ${detail}`;
 }
 
 // ---------- connection ----------
@@ -169,6 +178,7 @@ async function connect(id: string | null): Promise<void> {
   muted = false;
   pttHeld = false;
   phase = "listening";
+  clearTimeout(thinkingTimer);
   activeId = id;
   sidebar.setActive(id);
   if (id) {
@@ -184,6 +194,14 @@ async function connect(id: string | null): Promise<void> {
   conn = "connecting";
   render();
 
+  let micProblem: string | HTMLElement | null = null;
+  const failMic = (g: number) => {
+    if (g !== generation) return;
+    conn = "error";
+    showNotice(micProblem);
+    render();
+    void teardown();
+  };
   const c = new PipecatClient({
     transport: new SmallWebRTCTransport(),
     enableMic: true,
@@ -202,10 +220,25 @@ async function connect(id: string | null): Promise<void> {
         showNotice(`Assistant error: ${describe(msg)}`);
         render();
       },
+      onDeviceError: (err) => {
+        if (gen !== generation) return;
+        micProblem = micProblemNotice(err.type, err.message);
+        if (conn === "live") failMic(gen);
+      },
+      onMediaStateChanged: (ms) => {
+        if (gen !== generation || ms.mic.state !== "error") return;
+        micProblem ??= micProblemNotice(ms.mic.reason, String(ms.mic.details ?? ""));
+        if (conn === "live") failMic(gen);
+      },
       onUserStartedSpeaking: () => setPhase(gen, "userSpeaking"),
-      onUserStoppedSpeaking: () => setPhase(gen, "thinking"),
+      // Ignore out-of-order events: only leave the phase the event belongs to.
+      onUserStoppedSpeaking: () => {
+        if (phase === "userSpeaking") setPhase(gen, "thinking");
+      },
       onBotStartedSpeaking: () => setPhase(gen, "speaking"),
-      onBotStoppedSpeaking: () => setPhase(gen, "listening"),
+      onBotStoppedSpeaking: () => {
+        if (phase === "speaking") setPhase(gen, "listening");
+      },
       onLocalAudioLevel: (l: number) => {
         if (gen === generation && (phase === "listening" || phase === "userSpeaking") && !muted) {
           orb.setLevel(Math.min(1, l * 2));
@@ -239,6 +272,14 @@ async function connect(id: string | null): Promise<void> {
     return;
   }
   if (gen !== generation) return;
+  if (!micProblem && c.mediaState.mic.state === "error") {
+    const m = c.mediaState.mic;
+    micProblem = micProblemNotice(m.reason, String(m.details ?? ""));
+  }
+  if (micProblem) {
+    failMic(gen);
+    return;
+  }
   conn = "live";
   phase = "listening";
   render();
@@ -248,7 +289,7 @@ async function connect(id: string | null): Promise<void> {
     const list = await listConversations();
     if (gen !== generation) return;
     sidebar.setConversations(list);
-    if (!id && list[0]) {
+    if ((!id || !list.some((x) => x.id === id)) && list[0]) {
       activeId = list[0].id;
       sidebar.setActive(activeId);
     }
@@ -266,6 +307,13 @@ function describe(e: unknown): string {
 function setPhase(gen: number, p: Phase): void {
   if (gen !== generation || conn !== "live") return;
   phase = p;
+  clearTimeout(thinkingTimer);
+  if (p === "thinking") {
+    // VAD can fire while STT returns nothing; don't swirl forever.
+    thinkingTimer = window.setTimeout(() => {
+      if (gen === generation && phase === "thinking") setPhase(gen, "listening");
+    }, THINKING_TIMEOUT_MS);
+  }
   orb.setLevel(0);
   render();
 }
@@ -279,10 +327,12 @@ async function disconnectByUser(): Promise<void> {
 }
 
 async function restartAndReconnect(): Promise<void> {
+  if (conn !== "error") return; // already in flight
   const id = activeId;
   generation++;
-  conn = "connecting";
+  conn = "connecting"; // render() below removes the Reconnect/Restart buttons
   showNotice(null);
+  render();
   captionEl.textContent = "Restarting LLM…";
   await teardown();
   try {
@@ -326,6 +376,7 @@ function setMic(on: boolean): void {
 muteBtn.addEventListener("click", () => {
   if (conn !== "live") return;
   muted = !muted;
+  pttHeld = false; // an in-flight Space hold must not re-mute on keyup
   setMic(!muted);
   render();
 });

@@ -92,6 +92,17 @@ class History:
             self._conn.execute("DELETE FROM conversations WHERE id = ?", (id,))
             self._conn.commit()
 
+    def prune_empty(self, exclude_id: str | None = None) -> int:
+        """Delete conversations with no messages (except exclude_id). Returns count."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM conversations WHERE id IS NOT ? AND NOT EXISTS "
+                "(SELECT 1 FROM messages WHERE messages.conversation_id = conversations.id)",
+                (exclude_id,),
+            )
+            self._conn.commit()
+            return cur.rowcount
+
     def context_window(self, id: str, n: int = 20) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(

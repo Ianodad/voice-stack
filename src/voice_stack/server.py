@@ -56,6 +56,7 @@ class SessionManager:
     async def start(self, connection, conversation_id: str | None) -> str:
         async with self._lock:
             await self._cancel_current("replaced")
+            self._history.prune_empty()
 
             known = {c["id"] for c in self._history.list()}
             created = conversation_id not in known
@@ -105,6 +106,10 @@ class SessionManager:
             finally:
                 if self._current is session:
                     self._current = None
+                # Session over: drop conversations nobody spoke in, but never
+                # the one belonging to a different, currently live session.
+                live = self._current
+                history.prune_empty(live.cid if live is not None else None)
 
         session.task = asyncio.create_task(_run())
         self._all_tasks.append(session.task)
