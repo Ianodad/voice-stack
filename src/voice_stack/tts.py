@@ -57,6 +57,10 @@ class MLXKokoroTTSService(TTSService):
         # Loaded on the shared MLX executor thread, not the caller's thread.
         self._model = executor.submit(load_model, model_id).result()
 
+    def can_generate_metrics(self) -> bool:
+        # Base class gates TTFB/processing metrics on this; default is False.
+        return True
+
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
         loop = asyncio.get_running_loop()
         # model.generate() is a lazy generator (one GenerationResult per

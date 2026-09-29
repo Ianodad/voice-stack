@@ -41,6 +41,10 @@ class ParakeetSTTService(SegmentedSTTService):
         # Loaded on the shared MLX executor thread, not the caller's thread.
         self._model = executor.submit(from_pretrained, model_id).result()
 
+    def can_generate_metrics(self) -> bool:
+        # Base class gates TTFB/processing metrics on this; default is False.
+        return True
+
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         loop = asyncio.get_running_loop()
         with tempfile.NamedTemporaryFile(suffix=".wav") as f:
