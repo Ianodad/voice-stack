@@ -136,6 +136,50 @@ async def main() -> None:
                 assert (await http.get(f"{base}/api/conversations")).json() == []
                 print("history REST: ok")
 
+                # --- request guard (I2): Host / Origin / Content-Type ---
+                r = await http.get(f"{base}/api/conversations", headers={"Host": "evil.example.com"})
+                assert r.status_code == 403, f"bad Host accepted: {r.status_code}"
+                r = await http.get(f"{base}/api/conversations", headers={"Origin": "http://evil.example.com"})
+                assert r.status_code == 403, f"foreign Origin accepted: {r.status_code}"
+                r = await http.post(f"{base}/api/llm/restart", headers={"Origin": "https://evil.example.com"})
+                assert r.status_code == 403, f"cross-site restart accepted: {r.status_code}"
+                r = await http.post(
+                    f"{base}/api/offer", content='{"sdp":"x","type":"offer"}',
+                    headers={"Content-Type": "text/plain"},
+                )
+                assert r.status_code == 415, f"text/plain offer accepted: {r.status_code}"
+                r = await http.get(f"{base}/api/conversations", headers={"Origin": base})
+                assert r.status_code == 200, "same-origin request rejected"
+                assert "access-control-allow-origin" not in r.headers
+                print("request guard: ok")
+
+                # --- failed session start (I1): 503, no dangling pc, no orphan conversation ---
+                import voice_stack.server as srv
+
+                real_build = srv.build_worker
+
+                def boom(*a, **k):
+                    raise RuntimeError("forced build failure")
+
+                srv.build_worker = boom
+                try:
+                    pc = RTCPeerConnection()
+                    pc.createDataChannel("chat")
+                    pc.addTransceiver("audio", direction="sendrecv")
+                    await pc.setLocalDescription(await pc.createOffer())
+                    r = await http.post(
+                        f"{base}/api/offer",
+                        json={"sdp": pc.localDescription.sdp, "type": pc.localDescription.type},
+                    )
+                    await pc.close()
+                finally:
+                    srv.build_worker = real_build
+                assert r.status_code == 503, (r.status_code, r.text)
+                assert app.state.handler._pcs_map == {}, "dangling peer connection"
+                assert (await http.get(f"{base}/api/conversations")).json() == [], "orphan conversation"
+                assert sessions.live_workers() == 0
+                print("failed start -> 503, no pc, no orphan conversation: ok")
+
                 # --- offer #1 (continues a fresh conversation), real negotiation ---
                 c1 = Client(base, http, None)
                 await c1.offer()
@@ -195,7 +239,7 @@ async def main() -> None:
                 await asyncio.sleep(1.0)
                 assert not c3.speaking_now(window=1.0), "bot resumed after interrupt"
                 print("interrupt: ok (headless audio measurement; not audible-by-human)")
-                await c3.close()
+                assert sessions.live_workers() == 1, "c3 session should still be live"
 
                 # --- LLM restart: event loop stays responsive; old log handle closed ---
                 old_log = rt.llm_server._log_file
@@ -209,8 +253,33 @@ async def main() -> None:
                 assert (await restart).status_code == 200
                 assert worst < 1.0, f"event loop blocked during restart ({worst:.2f}s)"
                 assert old_log is not None and old_log.closed, "old llm log handle leaked"
-                assert sessions.live_workers() == 0, "restart left a live worker"
-                print(f"llm restart: ok (worst concurrent GET latency {worst*1000:.0f}ms)")
+                assert sessions.live_workers() == 0, "restart left a live worker (live session)"
+                await c3.close()
+                print(f"llm restart WITH live session: ok (worst concurrent GET latency {worst*1000:.0f}ms)")
+
+            # --- MLXLMServer: stop() then start() must not spawn (M1) ---
+            import subprocess
+
+            from voice_stack.llm_server import MLXLMServer
+            from voice_stack.runtime import LLM_MODEL_ID
+
+            def n_mlx() -> int:
+                out = subprocess.run(["pgrep", "-f", "mlx_lm.server"], capture_output=True, text=True)
+                return len(out.stdout.split())
+
+            before = n_mlx()
+            srv2 = MLXLMServer(model_id=LLM_MODEL_ID, port=8099)
+            srv2.stop()
+            for fn in (srv2.start, srv2.restart):
+                try:
+                    fn(timeout=5)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("start/restart after stop() did not refuse")
+            await asyncio.sleep(0.5)
+            assert n_mlx() == before, "stopped MLXLMServer spawned a process"
+            print("MLXLMServer refuses spawn after stop(): ok")
 
             server.should_exit = True
             await serve

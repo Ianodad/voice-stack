@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -57,48 +58,58 @@ class SessionManager:
             await self._cancel_current("replaced")
 
             known = {c["id"] for c in self._history.list()}
-            cid = conversation_id if conversation_id in known else self._history.create()
-            history = self._history
-            transport = SmallWebRTCTransport(
-                connection,
-                TransportParams(audio_in_enabled=True, audio_out_enabled=True),
-            )
-            worker, _ = build_worker(
-                transport,
-                self._runtime,
-                history.context_window(cid),
-                mute_while_bot_speaks=False,
-                on_turn=lambda role, content: history.append(cid, role, content),
-            )
-            runner = WorkerRunner(handle_sigint=False, handle_sigterm=False)
-            session = _Session(cid, connection, worker, runner)
+            created = conversation_id not in known
+            cid = self._history.create() if created else conversation_id
+            try:
+                return await self._start_locked(connection, cid)
+            except BaseException:
+                # Don't leave an empty conversation behind for a failed start.
+                if created and not self._history.get(cid):
+                    self._history.delete(cid)
+                raise
 
-            @worker.rtvi.event_handler("on_client_message")
-            async def _on_client_message(rtvi, msg):
-                if msg.type == "interrupt":
-                    await worker.queue_frame(InterruptionFrame())
+    async def _start_locked(self, connection, cid: str) -> str:
+        history = self._history
+        transport = SmallWebRTCTransport(
+            connection,
+            TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+        )
+        worker, _ = build_worker(
+            transport,
+            self._runtime,
+            history.context_window(cid),
+            mute_while_bot_speaks=False,
+            on_turn=lambda role, content: history.append(cid, role, content),
+        )
+        runner = WorkerRunner(handle_sigint=False, handle_sigterm=False)
+        session = _Session(cid, connection, worker, runner)
 
-            @transport.event_handler("on_client_disconnected")
-            async def _on_disconnected(transport, webrtc_connection):
-                # No lock here: start() holds it while awaiting the old session,
-                # and that session's own disconnect event lands in this handler.
+        @worker.rtvi.event_handler("on_client_message")
+        async def _on_client_message(rtvi, msg):
+            if msg.type == "interrupt":
+                await worker.queue_frame(InterruptionFrame())
+
+        @transport.event_handler("on_client_disconnected")
+        async def _on_disconnected(transport, webrtc_connection):
+            # No lock here: start() holds it while awaiting the old session,
+            # and that session's own disconnect event lands in this handler.
+            if self._current is session:
+                asyncio.create_task(self._cancel_session(session, "client disconnected"))
+
+        async def _run() -> None:
+            try:
+                await runner.add_workers(worker)
+                await runner.run()
+            except Exception:
+                logger.exception("voice session crashed")
+            finally:
                 if self._current is session:
-                    asyncio.create_task(self._cancel_session(session, "client disconnected"))
+                    self._current = None
 
-            async def _run() -> None:
-                try:
-                    await runner.add_workers(worker)
-                    await runner.run()
-                except Exception:
-                    logger.exception("voice session crashed")
-                finally:
-                    if self._current is session:
-                        self._current = None
-
-            session.task = asyncio.create_task(_run())
-            self._all_tasks.append(session.task)
-            self._current = session
-            return cid
+        session.task = asyncio.create_task(_run())
+        self._all_tasks.append(session.task)
+        self._current = session
+        return cid
 
     async def stop(self) -> None:
         async with self._lock:
@@ -138,6 +149,31 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None) -> F
             await handler.close()
 
     app = FastAPI(lifespan=lifespan)
+
+    allowed_names = {"127.0.0.1", "localhost"}
+    dev_origin = "http://localhost:5173" if os.environ.get("VOICE_STACK_DEV") else None
+
+    @app.middleware("http")
+    async def guard(request: Request, call_next):
+        # Local-only app: defend against DNS rebinding (Host) and cross-site
+        # requests (Origin, simple text/plain POSTs). No CORS headers are sent.
+        host = request.headers.get("host", "")
+        if host.rsplit(":", 1)[0] not in allowed_names:
+            return JSONResponse({"detail": "bad Host"}, status_code=403)
+        origin = request.headers.get("origin")
+        if origin is not None and origin != dev_origin and origin not in (
+            f"http://{host}",
+        ):
+            return JSONResponse({"detail": "bad Origin"}, status_code=403)
+        if (
+            request.url.path.startswith("/api/")
+            and request.method in ("POST", "PATCH")
+            and request.headers.get("content-length", "0") != "0"
+            and request.headers.get("content-type", "").split(";")[0].strip().lower()
+            != "application/json"
+        ):
+            return JSONResponse({"detail": "Content-Type must be application/json"}, status_code=415)
+        return await call_next(request)
     offer_lock = asyncio.Lock()
     app.state.sessions = sessions
     app.state.handler = handler
@@ -154,10 +190,21 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None) -> F
                 await sessions.stop()
                 await handler.close()
 
+            errors: list[BaseException] = []
+
             async def on_connection(conn) -> None:
-                cids.append(await sessions.start(conn, conversation_id))
+                # Pipecat logs and swallows callback errors; capture ours.
+                try:
+                    cids.append(await sessions.start(conn, conversation_id))
+                except Exception as e:
+                    logger.exception("session start failed")
+                    errors.append(e)
+                    raise
 
             answer = await handler.handle_web_request(req, on_connection)
+            if errors:
+                await handler.close()
+                raise HTTPException(status_code=503, detail=f"session start failed: {errors[0]}")
         if answer is None:
             raise HTTPException(status_code=500, detail="no SDP answer")
         headers = {"X-Conversation-Id": cids[0]} if cids else {}

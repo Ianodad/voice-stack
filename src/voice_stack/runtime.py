@@ -206,8 +206,8 @@ class Runtime:
             self.executor.shutdown(wait=True)
 
     def _restart_llm_server_sync(self) -> None:
-        self.llm_server.stop()
-        self._start_llm_server()
+        print(f"Restarting mlx_lm.server ({LLM_MODEL_ID}) ...")
+        self.llm_server.restart(timeout=60.0)
 
     async def restart_llm(self) -> None:
         # Blocking subprocess stop/start (up to ~60s) must not stall the event
