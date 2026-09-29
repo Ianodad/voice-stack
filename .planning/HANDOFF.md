@@ -1,32 +1,11 @@
-## Handoff — Opus — voice-stack / Phase: Live voice loop MVP
+## Handoff — Opus — voice-stack / Web UI built, awaiting live test
 
-Current State: Research (docs/RESEARCH.md) + latency spike (docs/BENCHMARK.md, 729ms warm) committed on master.
-User picked next phase 2026-09-27: live voice loop MVP on Pipecat.
+Current State: web UI implemented (Tasks 1-4 + final fix wave) on branch phase/web-ui, tracking origin/main (public repo Ianodad/voice-stack). HEAD ecea8ac-equivalent (hashes rewritten by filter-repo 2026-09-29; live-run logs scrubbed from history; backup ~/voice-stack-backup-2026-09-29.bundle). Latest commit local only, NOT pushed.
 
-Decisions Made:
-- Branch `feature/voice-loop-mvp` from master.
-- Stack stays: parakeet-mlx STT, Qwen3.6-35B-A3B-4bit via mlx-lm, Kokoro-82M via mlx-audio, Silero VAD, Pipecat.
-- MVP must include: startup warmup through all 3 models, sentence-chunked TTS.
+Done: history.py (SQLite), runtime.py + bot.py (extracted), server.py (FastAPI, WebRTC, Origin/Host guard), web/ (Vite TS orb UI), bot audio playback fix, README. Reviews: Sonnet xhigh per task + Opus final (Codex out of quota until Oct 3). Checks: scripts/check_{history,web,stt,tts}.py, `uv run voice-stack --check` PASS.
 
-Done:
-- Pipecat research → `.planning/pipecat-research.md` (pipecat-ai 1.12.0; custom STT+TTS services; mlx_lm.server + OpenAILLMService; soundfile pin must relax to <0.14; no AEC → headphones).
-- `.planning/PLAN.md` rev 1 written (T1 deps → T2 stt ∥ T3 tts → T4 main → T5 live test).
+Remaining (user, on speakers): 1) `(cd web && npm ci && npm run build)`; `uv run voice-stack web`; open http://localhost:7860, hear bot, interrupt by voice, check no self-hearing. 2) hold Space while muted. 3) `pkill -f mlx_lm.server` mid-chat -> Restart LLM. Then record STT/LLM/TTS TTFB in docs/BENCHMARK.md.
+Then: push, add LICENSE (MIT recommended), merge phase/web-ui -> feature/voice-loop-mvp only on user go.
 
-In progress:
-- T1–T4 built by Sonnet executor; `uv run voice-stack --check` PASS re-verified by Opus 14:59 (LLM TTFT warm 187ms, no orphan server).
-- Sonnet xhigh review: SIGTERM-orphan blocker + stale-server message + TTS cancel comment fixed; SIGTERM cleanup re-verified by Opus (server 1→0).
-- Committed d386acc.
-- T5 live run #3 (16:10) WORKED: 22 turns, clean transcripts, mute mode on speakers. LLM TTFB live mean 0.43s (n=22; vs 0.18s in --check). STT/TTS custom services emit no TTFB metrics (follow-up). Bot claimed to run on 'Google's servers' → system prompt needs identity. Log saved .planning/live-run-2026-09-27.log.
-- T5 live run #1 (15:53) FAILED: (a) Pipecat injects role=developer on interruption → Qwen template raises 'Unexpected message role' → LLM dead; (b) speakers, no AEC → bot hears itself, interrupts itself, transcribes own speech. Executor fixing: supports_developer_role=False, --check now exercises Pipecat LLM path w/ developer msg, AlwaysUserMuteStrategy default + --barge-in flag.
-
-Remaining:
-1. T5: user runs `uv run voice-stack` with headphones; record live latency in docs/BENCHMARK.md.
-2. Synthesis in PLAN.md; merge decision (feature branch → master only on user go).
-
-Open Flags:
-- Echo/self-hearing: may need headphones unless AEC exists.
-- Known limits: SIGKILL/crash can still orphan mlx_lm.server (`pkill -f mlx_lm.server`); interrupted Kokoro sentence finishes on executor (~0.2s).
-
-Git State: branch phase/web-ui (from feature/voice-loop-mvp); HEAD b29a876.
-
-Resume instruction: plan written docs/superpowers/plans/2026-09-29-web-ui.md (task-0 gate PASSED: WebRTC viable). Awaiting user review + execution method choice, then execute Task 1.
+Open Flags: Safari play() rejection not retried; botTtsText-before-botStarted could split a line; Space on other focused buttons; scripts/spike_input.wav (user's voice?) is in the public repo; no LICENSE.
+Resume instruction: ask user for live-test results, fix what breaks, then push.
