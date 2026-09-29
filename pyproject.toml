@@ -16,7 +16,9 @@ dependencies = [
     "psutil>=7.2.2",
     "silero-vad>=6.2.3",
     "soundfile>=0.13.1,<0.14",
-    "pipecat-ai[local]==1.12.0",
+    "pipecat-ai[local,webrtc]==1.12.0",
+    "fastapi",
+    "uvicorn",
 ]
 
 [project.scripts]

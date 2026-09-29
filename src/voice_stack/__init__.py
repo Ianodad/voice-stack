@@ -82,6 +82,23 @@ async def async_main(check: bool, barge_in: bool) -> None:
         rt.stop()
 
 
+async def web_main(port: int) -> None:
+    import uvicorn
+
+    from voice_stack.history import History
+    from voice_stack.server import create_app
+
+    rt = Runtime()
+    try:
+        await rt.start()
+        app = create_app(rt, History(), REPO_ROOT / "web" / "dist")
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
+        print(f"Ready — open http://127.0.0.1:{port}")
+        await uvicorn.Server(config).serve()
+    finally:
+        rt.stop()
+
+
 def _raise_keyboard_interrupt(signum, frame) -> None:
     """Make SIGTERM take the same cleanup path as Ctrl-C (SIGINT).
 
@@ -110,9 +127,15 @@ def main() -> None:
             "(default, for speakers with no AEC) the mic is muted while the bot speaks."
         ),
     )
+    sub = parser.add_subparsers(dest="command")
+    web = sub.add_parser("web", help="Serve the browser UI (WebRTC) on 127.0.0.1.")
+    web.add_argument("--port", type=int, default=7860)
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
-        asyncio.run(async_main(check=args.check, barge_in=args.barge_in))
+        if args.command == "web":
+            asyncio.run(web_main(args.port))
+        else:
+            asyncio.run(async_main(check=args.check, barge_in=args.barge_in))
     except KeyboardInterrupt:
         pass

@@ -6,6 +6,7 @@ Both the local CLI loop and the web server build per-session pipelines from
 one Runtime (see bot.build_worker) so models load once per process.
 """
 
+import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -199,10 +200,17 @@ class Runtime:
         await self._warmup_llm()
 
     def stop(self) -> None:
-        self.llm_server.stop()
-        self.executor.shutdown(wait=True)
+        try:
+            self.llm_server.stop()
+        finally:
+            self.executor.shutdown(wait=True)
 
-    async def restart_llm(self) -> None:
+    def _restart_llm_server_sync(self) -> None:
         self.llm_server.stop()
         self._start_llm_server()
+
+    async def restart_llm(self) -> None:
+        # Blocking subprocess stop/start (up to ~60s) must not stall the event
+        # loop; run it on the default thread pool, never the MLX executor.
+        await asyncio.to_thread(self._restart_llm_server_sync)
         await self._warmup_llm()

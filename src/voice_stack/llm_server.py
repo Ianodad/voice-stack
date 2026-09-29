@@ -27,13 +27,16 @@ class MLXLMServer:
         self._host = host
         self._port = port
         self._process: subprocess.Popen | None = None
+        self._log_file = None
 
     @property
     def base_url(self) -> str:
         return f"http://{self._host}:{self._port}/v1"
 
     def start(self, timeout: float = 60.0) -> None:
+        self._close_log()
         log_file = open(LOG_PATH, "w")
+        self._log_file = log_file
         self._process = subprocess.Popen(
             [
                 sys.executable,
@@ -77,15 +80,25 @@ class MLXLMServer:
             f"`pkill -f mlx_lm.server` and retry."
         )
 
+    def _close_log(self) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            finally:
+                self._log_file = None
+
     def stop(self, grace_period: float = 5.0) -> None:
         """Terminate the subprocess, escalating to kill after a grace period."""
-        if self._process is None:
-            return
-        if self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=grace_period)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=grace_period)
-        self._process = None
+        try:
+            if self._process is None:
+                return
+            if self._process.poll() is None:
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=grace_period)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    self._process.wait(timeout=grace_period)
+            self._process = None
+        finally:
+            self._close_log()
