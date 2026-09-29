@@ -1,0 +1,104 @@
+:root {
+  color-scheme: dark light;
+  --bg: #0f1115;
+  --panel: #161a21;
+  --border: #262c36;
+  --text: #e6e9ef;
+  --text-dim: #98a1b0;
+  --btn: #1f2530;
+  --btn-hover: #2a3140;
+  --focus: #7aa2ff;
+  --danger: #ff6b6b;
+  --orb-listen: #5b8cff;
+  --orb-user: #46d19a;
+  --orb-bot: #b78cff;
+  --orb-muted: #6b7382;
+  --orb-error: #ff5c5c;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --border: #dde1e8;
+    --text: #1b1f27;
+    --text-dim: #5d6675;
+    --btn: #eceff4;
+    --btn-hover: #e0e5ee;
+    --focus: #2f5fe0;
+    --danger: #c62828;
+    --orb-listen: #3f6fe6;
+    --orb-user: #1ea77a;
+    --orb-bot: #8a5ce0;
+    --orb-muted: #9aa2b0;
+    --orb-error: #d63838;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  min-width: 900px; /* desktop only */
+}
+.app { display: grid; grid-template-columns: 280px 1fr; height: 100vh; }
+.sidebar {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; min-height: 0;
+}
+.sidebar-head { display: flex; align-items: center; justify-content: space-between; padding: 16px; }
+.sidebar h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: 0.02em; }
+.conv-list { list-style: none; margin: 0; padding: 0 8px 8px; overflow-y: auto; flex: 1; }
+.conv { display: flex; align-items: stretch; border-radius: 8px; }
+.conv.active { background: var(--btn); }
+.conv-open {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0;
+  text-align: left; background: none; border: 0; color: inherit; padding: 8px 10px;
+  border-radius: 8px; cursor: pointer; font: inherit;
+}
+.conv-open:hover, .conv-del:hover { background: var(--btn-hover); }
+.conv-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-time { font-size: 12px; color: var(--text-dim); }
+.conv-del {
+  background: none; border: 0; color: var(--text-dim); width: 32px; border-radius: 8px;
+  cursor: pointer; font-size: 18px; opacity: 0.5;
+}
+.conv:hover .conv-del, .conv-del:focus-visible { opacity: 1; }
+.main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.stage { display: flex; flex-direction: column; align-items: center; padding: 24px 24px 8px; }
+.caption { margin: 4px 0 0; color: var(--text-dim); min-height: 1.5em; }
+.notice {
+  max-width: 560px; margin-top: 12px; padding: 12px 14px; border-radius: 8px;
+  border: 1px solid var(--danger); color: var(--text); background: var(--panel); font-size: 14px;
+}
+.notice ul { margin: 6px 0 0; padding-left: 18px; }
+.actions { display: flex; gap: 8px; margin-top: 12px; min-height: 36px; }
+.transcript {
+  flex: 1; min-height: 0; overflow-y: auto; width: 100%; max-width: 720px;
+  margin: 0 auto; padding: 8px 24px;
+}
+.line { margin: 0 0 10px; display: flex; gap: 12px; }
+.who { flex: none; width: 72px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); padding-top: 3px; }
+.line.user .body { color: var(--text); }
+.line.bot .body { color: var(--text); opacity: 0.92; }
+.body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.controls {
+  display: flex; align-items: center; gap: 8px; justify-content: center;
+  padding: 12px 24px 16px; border-top: 1px solid var(--border);
+}
+.hint { margin-left: 12px; }
+.muted { color: var(--text-dim); }
+.small-text { font-size: 12px; }
+.sidebar .small-text { padding: 0 16px; }
+.btn {
+  background: var(--btn); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 16px; font: inherit; cursor: pointer;
+}
+.btn.small { padding: 4px 12px; font-size: 13px; }
+.btn:hover:not(:disabled) { background: var(--btn-hover); }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn.primary { background: var(--orb-listen); border-color: transparent; color: #fff; }
+.btn[aria-pressed="true"] { border-color: var(--orb-muted); }
+button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }

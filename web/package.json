@@ -1,0 +1,19 @@
+{
+  "name": "voice-stack-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@pipecat-ai/client-js": "^1.13.1",
+    "@pipecat-ai/small-webrtc-transport": "^1.10.8"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1"
+  }
+}

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Voice Stack</title>
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar" aria-label="Conversations">
+        <div class="sidebar-head">
+          <h1>Voice Stack</h1>
+          <button id="new-btn" class="btn small" type="button">New</button>
+        </div>
+        <ul id="conv-list" class="conv-list"></ul>
+        <p id="conv-empty" class="muted small-text" hidden>No conversations yet.</p>
+      </aside>
+      <main class="main">
+        <div class="stage">
+          <canvas id="orb" width="320" height="320" role="img" aria-label="Assistant status"></canvas>
+          <p id="caption" class="caption" aria-live="polite">Not connected</p>
+          <div id="notice" class="notice" role="alert" hidden></div>
+          <div id="actions" class="actions"></div>
+        </div>
+        <section id="transcript" class="transcript" aria-live="polite" aria-label="Transcript"></section>
+        <footer class="controls">
+          <button id="mute-btn" class="btn" type="button" aria-pressed="false" disabled>Mute</button>
+          <button id="stop-btn" class="btn" type="button" disabled>Disconnect</button>
+          <span class="hint muted small-text">Space: hold to talk while muted &middot; Esc: interrupt</span>
+        </footer>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
