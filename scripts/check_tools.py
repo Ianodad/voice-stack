@@ -201,4 +201,70 @@ with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outsid
     raises(T.apply_move, root, pm)                                      # replay: src gone
     # rel() is posix-relative
     assert T.rel(root, root/"deep/er/m3.txt") == "deep/er/m3.txt"
+    # ---- fix round 1 ----
+    # I1 lone surrogate / unencodable text
+    (root/"s1.txt").write_text("hello\n")
+    for nt in ["bye\ud800", "\udfff"]:
+        raises(T.plan_edit, root, "s1.txt", "hello", nt)
+    raises(T.plan_edit, root, "s1.txt", "hel\ud800lo", "x")
+    raises(T.apply_edit, root, {"kind": "edit", "path": "s1.txt", "old_text": "hello", "new_text": "bye\ud800",
+                                "sha256": "0" * 64})
+    assert (root/"s1.txt").read_text() == "hello\n"
+    # I2 read_file limit validation
+    assert T.read_file(root, "big.txt", limit=-2)["content"] == "" and T.read_file(root, "big.txt", limit=-5)["truncated"]
+    assert len(T.read_file(root, "big.txt", limit=10**9)["content"]) == 65536
+    assert T.read_file(root, "big.txt", limit="10")["content"] == "a" * 10
+    for badlim in [None, "ten", 1.5, [], True]:
+        raises(T.read_file, root, "big.txt", limit=badlim)
+    # I3 spoofing characters in paths and edit text
+    for ch in ["\u202e", "\u202a", "\u2066", "\u200b", "\u200f", "\ufeff", "\u2028", "\u2029", "\n", "\r", "\x0b", "\x0c", "\x85", "\t", "\x1b", "\x7f"]:
+        raises(T.plan_move, root, "invoice", f"archive/a{ch}b.txt")
+        raises(T.plan_move, root, f"inv{ch}oice", "archive/zz.txt")
+        raises(T.resolve, root, f"archive/a{ch}b.txt", must_exist=False)
+        raises(T.apply_move, root, {"kind": "move", "src": "invoice.txt", "dst": f"archive/a{ch}b.txt"})
+        if ch not in "\t\n\r":
+            raises(T.plan_edit, root, "s1.txt", "hello", f"x{ch}y")
+            raises(T.plan_edit, root, "s1.txt", f"hel{ch}lo", "y")
+    raises(T.plan_move, root, "invoice", "archive/\u202etxt.exe")
+    assert T.plan_edit(root, "s1.txt", "hello", "a\tb\nc\r\nd")["kind"] == "edit"   # legit whitespace ok
+    # diff lines mirror real file lines: \x0b \x0c \x85 \u2028 inside a file do not split lines
+    (root/"s2.txt").write_text("a\x0bb\nc\u2028d\x85e\nTARGET\n", encoding="utf-8")
+    pd = T.plan_edit(root, "s2.txt", "TARGET", "DONE")
+    lines = pd["diff"].split("\n")
+    assert "-TARGET" in lines and "+DONE" in lines
+    assert not any(c in pd["diff"] for c in "\x0b\x0c\x85\u2028\u2029\u202e"), repr(pd["diff"])
+    assert " a\\u000bb" in lines and " c\\u2028d\\u0085e" in lines, lines
+    (root/"s3.txt").write_text("one\r\ntwo\r\n")
+    pd = T.plan_edit(root, "s3.txt", "two", "2"); assert "\r" not in pd["diff"] and "-two" in pd["diff"].split("\n")
+    # M4 unlink failure after hardlink: no duplicate dst, no created dirs, retry works
+    (root/"ro_dir").mkdir(); (root/"ro_dir/mv.txt").write_text("keep")
+    pm = T.plan_move(root, "ro_dir/mv.txt", "fresh/sub/mv.txt")
+    os.chmod(root/"ro_dir", 0o500)
+    try:
+        if os.geteuid() != 0:
+            raises(T.apply_move, root, pm)
+            assert (root/"ro_dir/mv.txt").read_text() == "keep"
+            assert not (root/"fresh").exists(), "created dirs must be rolled back"
+    finally:
+        os.chmod(root/"ro_dir", 0o700)
+    T.apply_move(root, pm); assert (root/"fresh/sub/mv.txt").read_text() == "keep" and not (root/"ro_dir/mv.txt").exists()
+    # M5 result size cap
+    (root/"cap.txt").write_text("x" + "a" * (1024 * 1024 - 10))
+    assert raises(T.plan_edit, root, "cap.txt", "x", "y" * 100).args[0] == "too_large"
+    pc = T.plan_edit(root, "cap.txt", "x", "y" * 5)
+    pc["new_text"] = "y" * 100                     # forged-larger plan must be refused at apply
+    raises(T.apply_edit, root, pc); assert (root/"cap.txt").read_text().startswith("xaaa")
+    # M6 read-only file refused
+    (root/"ro.txt").write_text("frozen\n"); os.chmod(root/"ro.txt", 0o400)
+    raises(T.plan_edit, root, "ro.txt", "frozen", "thawed")
+    (root/"ro2.txt").write_text("frozen\n"); pr = T.plan_edit(root, "ro2.txt", "frozen", "thawed")
+    os.chmod(root/"ro2.txt", 0o400); raises(T.apply_edit, root, pr)
+    assert (root/"ro2.txt").read_text() == "frozen\n"
+    # M8 non-str args raise ToolError everywhere
+    for bad in [None, 5, b"x", ["a"], {"a": 1}]:
+        raises(T.resolve, root, bad); raises(T.list_dir, root, bad); raises(T.read_file, root, bad)
+        raises(T.file_info, root, bad); raises(T.plan_move, root, bad, "a"); raises(T.plan_move, root, "invoice", bad)
+        raises(T.plan_edit, root, bad, "a", "b"); raises(T.plan_edit, root, "s1.txt", bad, "b")
+        raises(T.plan_edit, root, "s1.txt", "hello", bad)
+        assert T.find_file(root, bad) == []
     print("check_tools.py: PASS")

@@ -47,6 +47,10 @@ def _fold(s: str) -> str:
     return unicodedata.normalize("NFKC", s).casefold()
 
 
+# Control, format (bidi overrides, zero-width, BOM), line/paragraph separators, surrogates
+# are never allowed in a path: they could spoof what the confirmation card shows.
+_BAD_PATH_CATS = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+
 _HIDDEN_FOLDED = {_fold(h) for h in HIDDEN}
 
 
@@ -120,8 +124,8 @@ def _candidate(root_real: Path, path: str) -> Path:
         raise ToolError("path must be text", code="bad_path")
     if path == "" or path.strip() == "":
         raise ToolError("path is empty", code="bad_path")
-    if "\x00" in path:
-        raise ToolError("path contains an invalid character", code="bad_path")
+    if any(unicodedata.category(c) in _BAD_PATH_CATS for c in path):
+        raise ToolError("path contains an invalid or invisible character", code="bad_path")
     if len(path) > 4096 or any(len(seg.encode("utf-8", "surrogatepass")) > 255 for seg in path.split("/")):
         raise ToolError("path too long", code="bad_path")
     try:
@@ -288,7 +292,9 @@ def _decode(data: bytes, truncated: bool) -> str:
 # ---------------------------------------------------------------- read tools
 
 def list_dir(root: Path, path: str = ".") -> list[dict]:
-    real = resolve(root, path if path and path.strip() else ".")
+    if not isinstance(path, str):
+        raise ToolError("path must be text", code="bad_path")
+    real = resolve(root, path if path.strip() else ".")
     if not real.is_dir():
         raise ToolError("not a directory", code="not_a_directory")
     rr = _root_real(root)
@@ -336,6 +342,11 @@ def find_file(root: Path, name: str) -> list[str]:
 
 
 def read_file(root: Path, path: str, limit: int = 65536) -> dict:
+    if isinstance(limit, str) and limit.strip().isdigit():
+        limit = int(limit)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ToolError("limit must be a whole number", code="bad_args")
+    limit = max(0, min(limit, 65536))
     real = resolve(root, path)
     if real.is_dir():
         raise ToolError("that is a folder, not a file", code="not_a_file")
@@ -394,7 +405,13 @@ def apply_move(root: Path, plan: dict) -> dict:
         raise ToolError("invalid move plan", code="bad_plan")
     real_src, real_dst = _check_move(root, plan["src"], plan["dst"], exact=True)
     rr = _root_real(root)
+    made: list[Path] = []
+    linked = False
     try:
+        anc = real_dst.parent
+        while not _lexists(anc) and anc != rr:
+            made.append(anc)
+            anc = anc.parent
         real_dst.parent.mkdir(parents=True, exist_ok=True)
         # re-check after mkdir: parent must still be inside root and not hidden
         parent_real = Path(os.path.realpath(real_dst.parent))
@@ -409,10 +426,22 @@ def apply_move(root: Path, plan: dict) -> dict:
                 raise ToolError("destination already exists; moves never overwrite", code="exists")
             real_src.rename(real_dst)             # filesystem without hard links
         else:
+            linked = True
             os.unlink(real_src)
-    except ToolError:
-        raise
-    except OSError as e:
+    except (ToolError, OSError) as e:
+        # roll back: no duplicate link, no empty dirs this call created
+        if linked and _lexists(real_src):
+            try:
+                os.unlink(real_dst)
+            except OSError:
+                pass
+        for dpath in made:          # deepest first
+            try:
+                os.rmdir(dpath)
+            except OSError:
+                pass
+        if isinstance(e, ToolError):
+            raise
         raise ToolError(f"move failed: {e.strerror or 'filesystem error'}", code="io_error")
     return {"src": rel(root, real_src), "dst": rel(root, real_dst)}
 
@@ -433,8 +462,26 @@ def _check_edit_text(old_text: str, new_text: str) -> None:
         raise ToolError("old_text and new_text must be text", code="bad_args")
     if old_text == "":
         raise ToolError("old_text must not be empty", code="bad_args")
-    if "\x00" in old_text or "\x00" in new_text:
-        raise ToolError("text contains an invalid character", code="bad_args")
+    for t in (old_text, new_text):
+        for c in t:
+            cat = unicodedata.category(c)
+            if cat in ("Cf", "Zl", "Zp", "Cs") or (cat == "Cc" and c not in "\t\n\r"):
+                raise ToolError("text contains an invalid or invisible character", code="bad_args")
+        try:
+            t.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ToolError("text is not valid unicode", code="bad_args")
+
+
+def _display(line: str) -> str:
+    """Make invisible/control characters in diff context lines visible."""
+    return "".join(
+        f"\\u{ord(c):04x}" if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp", "Cs") and c != "\t" else c
+        for c in line.rstrip("\r"))
+
+
+def _lines(text: str) -> list[str]:
+    return [_display(x) for x in text.split("\n")]
 
 
 def plan_edit(root: Path, path: str, old_text: str, new_text: str) -> dict:
@@ -448,7 +495,11 @@ def plan_edit(root: Path, path: str, old_text: str, new_text: str) -> dict:
         raise ToolError(f"old_text must match exactly once; it matched {count} times", code="match_count")
     r = rel(root, real)
     new = text.replace(old_text, new_text, 1)
-    diff = "\n".join(difflib.unified_diff(text.splitlines(), new.splitlines(),
+    if len(new.encode("utf-8")) > MAX_EDIT_BYTES:
+        raise ToolError("too_large")
+    if not os.stat(real).st_mode & stat.S_IWUSR:
+        raise ToolError("that file is read-only", code="read_only")
+    diff = "\n".join(difflib.unified_diff(_lines(text), _lines(new),
                                           fromfile=r, tofile=r, lineterm=""))
     return {"kind": "edit", "path": r, "old_text": old_text, "new_text": new_text,
             "summary": f"Edit {r}", "diff": diff, "sha256": hashlib.sha256(data).hexdigest()}
@@ -466,6 +517,8 @@ def _backup_dir(root: Path) -> Path:
 
 
 def apply_edit(root: Path, plan: dict) -> dict:
+    """Re-validate and apply a plan. The atomic replace creates a new inode, so any
+    other hard links to the edited file keep the old content."""
     if not isinstance(plan, dict) or plan.get("kind") != "edit" or not isinstance(plan.get("path"), str) \
             or not isinstance(plan.get("sha256"), str):
         raise ToolError("invalid edit plan", code="bad_plan")
@@ -479,7 +532,11 @@ def apply_edit(root: Path, plan: dict) -> dict:
     if count != 1:
         raise ToolError(f"old_text must match exactly once; it matched {count} times", code="match_count")
     new_bytes = text.replace(old_text, new_text, 1).encode("utf-8")
+    if len(new_bytes) > MAX_EDIT_BYTES:
+        raise ToolError("too_large")
     mode = stat.S_IMODE(os.stat(real).st_mode)
+    if not mode & stat.S_IWUSR:
+        raise ToolError("that file is read-only", code="read_only")
     r = rel(root, real)
     try:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
