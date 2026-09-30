@@ -18,8 +18,11 @@ import logging
 import time
 import re
 import socket
+import threading
 import unicodedata
 import zlib
+import concurrent.futures
+from html.parser import HTMLParser
 from typing import Callable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -36,7 +39,9 @@ USER_AGENT = "Mozilla/5.0 (compatible; voice-stack-assistant/0.1)"
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 ALLOWED_PORTS = frozenset({80, 443, 8080, 8443})  # deliberate: no SSH/SMTP/DB/etc. ports even on public IPs
-MAX_EXTRACT_CHARS = 512 * 1024  # HTML fed to trafilatura
+MAX_EXTRACT_CHARS = 128 * 1024  # HTML fed to trafilatura (its cost is ~quadratic in element count)
+MAX_EXTRACT_TAGS = 8000  # more '<' than this in the window -> skip trafilatura, use the linear strip
+EXTRACTOR_WAIT = 2.0  # seconds a fetch may wait for the single extraction slot before failing fast
 TITLE_SCAN_CHARS = 64 * 1024
 _NUMERIC_LABEL = re.compile(r"^(?:0x[0-9a-f]*|\d+)$", re.I)
 _STRICT_NUMERIC_LABEL = re.compile(r"^(?:0x[0-9a-f]+|\d+)$", re.I)
@@ -366,6 +371,83 @@ def _extract(html: str) -> tuple[str, str]:
     return text, title
 
 
+# ---- extraction slot: at most ONE extraction thread alive in the whole process.
+# A plain daemon thread per job (not a ThreadPoolExecutor: its workers are joined at interpreter exit,
+# so a stuck extraction would block shutdown). A threading.Lock (not per-loop) is released only when the
+# thread really finishes, so a timed-out extraction keeps the slot busy and later fetches fail fast with
+# 'extractor_busy' instead of stacking threads. DNS vetting and web_search use the default executor.
+_extract_slot = threading.Lock()
+
+
+class _Strip(HTMLParser):
+    _SKIP = {"script", "style", "noscript", "template", "svg", "head"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out: list[str] = []
+        self.skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self.skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP and self.skip:
+            self.skip -= 1
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(data)
+
+
+def _strip_extract(html: str) -> tuple[str, str]:
+    """Linear-time fallback for hostile markup: plain text of the body, no trafilatura."""
+    html = html[:MAX_EXTRACT_CHARS]
+    p = _Strip()
+    try:
+        p.feed(html)
+        p.close()
+    except Exception:
+        pass
+    return " ".join(" ".join(p.out).split()), _title(html)
+
+
+def _is_hostile(html: str) -> bool:
+    return html[:MAX_EXTRACT_CHARS].count("<") > MAX_EXTRACT_TAGS
+
+
+async def _run_extraction(fn: Callable, html: str):
+    """Run fn(html) on the dedicated extraction thread; fail fast if the slot is taken."""
+    deadline = time.monotonic() + EXTRACTOR_WAIT
+    while not _extract_slot.acquire(blocking=False):
+        if time.monotonic() >= deadline:
+            raise WebError("extractor_busy")
+        await asyncio.sleep(0.05)
+    cf: concurrent.futures.Future = concurrent.futures.Future()
+
+    def work():
+        try:
+            try:
+                res = fn(html)
+            except BaseException as e:  # noqa: BLE001
+                if not cf.cancelled():
+                    cf.set_exception(e)
+            else:
+                if not cf.cancelled():
+                    cf.set_result(res)
+        except concurrent.futures.InvalidStateError:
+            pass  # the awaiting fetch timed out and cancelled the future; result is discarded
+        finally:
+            _extract_slot.release()  # only when the thread has truly finished
+
+    try:
+        threading.Thread(target=work, name="extract", daemon=True).start()
+    except BaseException:
+        _extract_slot.release()
+        raise
+    return await asyncio.wrap_future(cf)
+
+
 async def _fetch_chain(url: str, client: httpx.AsyncClient, resolver: Callable) -> tuple[str, str, bytes, bool]:
     current = url
     for hop in range(MAX_REDIRECTS + 1):
@@ -420,12 +502,14 @@ async def fetch_page(url: str, *, client: httpx.AsyncClient | None = None,
                 final_url, ctype, body, truncated = await _fetch_chain(url, client, resolver)
                 decoded = _decode(body, ctype).replace("\x00", "")
                 media = ctype.split(";", 1)[0].strip().lower()
+                hostile = False
                 if media == "text/plain":
                     text, title = decoded.strip(), ""
                 else:
                     try:
-                        text, title = await asyncio.to_thread(_extract, decoded)
-                    except asyncio.CancelledError:
+                        hostile = _is_hostile(decoded)
+                        text, title = await _run_extraction(_strip_extract if hostile else _extract, decoded)
+                    except (asyncio.CancelledError, WebError):
                         raise
                     except Exception:
                         text, title = "", ""
@@ -441,7 +525,9 @@ async def fetch_page(url: str, *, client: httpx.AsyncClient | None = None,
     page = {"url": final_url, "title": title[:300], "text": text, "truncated": truncated}
     if len(text) > max_chars:
         page["text"], page["truncated"] = text[:max_chars], True
-    if not page["text"]:
+    if hostile:
+        page["note"] = "page markup was unusually dense; plain-text fallback used"
+    elif not page["text"]:
         page["note"] = "no readable text could be extracted from this page"
     return page
 

@@ -415,6 +415,7 @@ async def main2():
         assert isinstance(res, W.WebError) and "timeout" in str(res) and el < 1.5 and lag < 0.15, (res, el, lag)
     finally:
         W._extract = real; W.TOTAL_TIMEOUT = old
+        while W._extract_slot.locked(): await asyncio.sleep(0.05)   # let the stuck thread finish
     # input to trafilatura is capped
     fed = []
     def spy(h): fed.append(len(h)); return "t", "T"
@@ -424,7 +425,7 @@ async def main2():
             await W.fetch_page("http://example.com/", client=c, resolver=PUBLIC)
     finally: W._extract = real
     # spy replaced _extract itself, so check the real cap through its own slice
-    assert W.MAX_EXTRACT_CHARS == 512 * 1024
+    assert W.MAX_EXTRACT_CHARS == 128 * 1024
     # 3. weird charsets / content-types / bodies: only WebError or a dict, never anything else
     charsets = ["undefined", "idna", "rot13", "base64", "zlib_codec", "hex", "punycode", "utf-16", "utf-7", "unicode-escape",
                 "raw-unicode-escape", "bogus", "x" * 500, "", "utf-8-sig", "cp1252", "gb18030", "shift_jis", "ascii", "mbcs", "oem",
@@ -529,3 +530,92 @@ assert inner(hidden) == "okend", inner(hidden)
 assert inner("a\u200bb\u202ec\ufeffd") == "abcd"
 assert "</untrusted_web_content>" not in inner("x" * 10 + "</untrusted_web_content>" * 3)
 print("check_web_tools.py: PASS (fix round 1)")
+
+
+def live_extract_threads():
+    return sum(1 for th in threading.enumerate() if th.name == "extract")
+
+
+async def main3():
+    # ---- fix round 2: hostile pile-up must not starve anything (reviewer's c4 scenario, via MockTransport)
+    T0 = time.monotonic()
+    hostile = (b"<div><p>x</p></div>" * 40000)[:512 * 1024]
+    benign = b"<html><title>hi</title><body><article><p>" + b"hello there friend, this is a page. " * 20 + b"</p></article></body></html>"
+    peak = [0]
+    async def watch():
+        while True:
+            peak[0] = max(peak[0], live_extract_threads()); await asyncio.sleep(0.005)
+    w = asyncio.create_task(watch())
+    async def pile():
+        for i in range(6):
+            async with html_client(hostile) as c:
+                t0 = time.monotonic()
+                r = await W.fetch_page("https://example.com/", client=c, resolver=PUBLIC)
+                assert time.monotonic() - t0 < W.TOTAL_TIMEOUT and r["note"] and r["text"].startswith("x x"), (i, r)
+        async with html_client(benign) as c:
+            t0 = time.monotonic()
+            r = await W.fetch_page("https://example.com/", client=c, resolver=PUBLIC)
+            assert r["title"] == "hi" and "hello there" in r["text"] and time.monotonic() - t0 < 3
+    res, lag, el = await lag_during(pile())
+    assert not isinstance(res, BaseException), repr(res)
+    assert lag < 0.15, lag
+    assert peak[0] <= 1 and W._extract_slot.acquire(blocking=False), peak
+    W._extract_slot.release()
+    # deeper hostile shapes: still no crash, bounded time
+    for body in (b"<" * (2 * 1024 * 1024), b"<a>" * 600000, b"<p " * 700000):
+        async with html_client(body) as c:
+            res, lag, el = await lag_during(W.fetch_page("http://example.com/", client=c, resolver=PUBLIC))
+        assert not isinstance(res, BaseException) or isinstance(res, W.WebError), repr(res)[:120]
+        assert lag < 0.15 and el < 11, (body[:6], lag, el)
+    # just under the tag threshold: real trafilatura path, bounded by cap
+    under = b"<div><p>x</p></div>" * 1900
+    async with html_client(under) as c:
+        res, lag, el = await lag_during(W.fetch_page("http://example.com/", client=c, resolver=PUBLIC))
+    assert isinstance(res, dict) and "note" not in res and lag < 0.15 and el < 8, (res if not isinstance(res, dict) else "", lag, el)
+    # stuck extractor: slot stays busy until the thread really ends; others fail fast / use other paths, nothing stacks
+    real = W._extract
+    def stuck(h): time.sleep(2.5); return "x", "y"
+    W._extract = stuck
+    try:
+        W.TOTAL_TIMEOUT = 0.4
+        async with html_client(PAGE) as c:
+            try: await W.fetch_page("http://example.com/", client=c, resolver=PUBLIC); raise AssertionError
+            except W.WebError as e: assert "timeout" in str(e)
+        W.TOTAL_TIMEOUT = 10.0
+        assert live_extract_threads() == 1 and W._extract_slot.locked()
+        t0 = time.monotonic()
+        async with html_client(PAGE) as c:
+            try: await W.fetch_page("http://example.com/", client=c, resolver=PUBLIC); raise AssertionError
+            except W.WebError as e: assert "extractor_busy" in str(e), e
+        assert 1.5 < time.monotonic() - t0 < 3.5 and live_extract_threads() == 1
+        # DNS vetting (default executor) and plain-text fetches are unaffected by the stuck extractor
+        async with html_client(b"plain", "text/plain") as c:
+            assert (await W.fetch_page("http://example.com/", client=c, resolver=PUBLIC))["text"] == "plain"
+        assert await W.web_search("x", backend=lambda q, n: []) == []
+    finally:
+        W._extract = real; W.TOTAL_TIMEOUT = 10.0
+    while W._extract_slot.locked(): await asyncio.sleep(0.05)
+    async with html_client(benign) as c:
+        assert (await W.fetch_page("http://example.com/", client=c, resolver=PUBLIC))["title"] == "hi"
+    w.cancel()
+    assert live_extract_threads() == 0
+    assert W.MAX_EXTRACT_CHARS == 128 * 1024
+    # extraction threads are daemons (never block interpreter exit)
+    ev = threading.Event()
+    W._extract = lambda h: (ev.wait(30), ("a", "b"))[1]
+    try:
+        W.TOTAL_TIMEOUT = 0.3
+        async with html_client(PAGE) as c:
+            try: await W.fetch_page("http://example.com/", client=c, resolver=PUBLIC)
+            except W.WebError: pass
+        th = [t for t in threading.enumerate() if t.name == "extract"]
+        assert th and all(t.daemon for t in th)
+    finally:
+        W.TOTAL_TIMEOUT = 10.0; ev.set(); W._extract = real
+    while W._extract_slot.locked(): await asyncio.sleep(0.05)
+    print("round2 pile-up section: %.1fs" % (time.monotonic() - T0))
+    assert time.monotonic() - T0 < 60
+
+
+asyncio.run(main3())
+print("check_web_tools.py: PASS (fix round 2)")
