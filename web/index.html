@@ -20,17 +20,20 @@
         <div class="stage">
           <canvas id="orb" width="320" height="320" role="img" aria-label="Assistant status"></canvas>
           <p id="caption" class="caption" aria-live="polite">Not connected</p>
+          <p id="activity" class="activity" aria-live="polite"></p>
           <div id="notice" class="notice" role="alert" hidden></div>
           <div id="actions" class="actions"></div>
           <button id="sound-banner" class="banner" type="button" hidden>Sound is blocked or muted &mdash; click here to enable</button>
         </div>
         <p id="beep-note" class="muted small-text beep-note" aria-live="polite" hidden></p>
         <section id="transcript" class="transcript" aria-live="polite" aria-label="Transcript"></section>
+        <div id="action-result" class="action-result" aria-live="polite"></div>
+        <div id="action-card-host" class="action-card-host" hidden></div>
         <footer class="controls">
           <button id="mute-btn" class="btn" type="button" aria-pressed="false" disabled>Mute</button>
           <button id="stop-btn" class="btn" type="button" disabled>Disconnect</button>
           <button id="beep-btn" class="btn" type="button">Test speaker</button>
-          <span class="hint muted small-text">Space: hold to talk while muted &middot; Esc: interrupt</span>
+          <span class="hint muted small-text">Space: hold to talk while muted &middot; Esc: interrupt (or deny a confirmation)</span>
         </footer>
       </main>
     </div>

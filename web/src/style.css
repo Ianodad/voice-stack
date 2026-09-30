@@ -8,6 +8,8 @@
   --btn: #1f2530;
   --btn-hover: #2a3140;
   --focus: #7aa2ff;
+  --accent: #ff8a65;
+  --accent-hover: #ff9e80;
   --danger: #ff6b6b;
   --orb-listen: #5b8cff;
   --orb-user: #46d19a;
@@ -25,6 +27,8 @@
     --btn: #eceff4;
     --btn-hover: #e0e5ee;
     --focus: #2f5fe0;
+    --accent: #e8683f;
+    --accent-hover: #d95a31;
     --danger: #c62828;
     --orb-listen: #3f6fe6;
     --orb-user: #1ea77a;
@@ -130,3 +134,33 @@ body {
 .btn[aria-pressed="true"] { border-color: var(--orb-muted); }
 button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+.activity { margin: 2px 0 0; min-height: 1.4em; font-size: 13px; color: var(--text-dim); font-style: italic; }
+.action-result { text-align: center; min-height: 1.5em; font-size: 14px; color: var(--text); padding: 2px 24px; }
+.action-card-host { width: 100%; max-width: 720px; margin: 0 auto; padding: 0 24px 12px; }
+.action-card {
+  background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--accent);
+  border-radius: 10px; padding: 14px 16px; outline: none;
+}
+.action-card:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.action-card h2 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+.action-summary { margin: 0 0 10px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.action-diff {
+  margin: 0 0 12px; padding: 8px 0; max-height: 240px; overflow: auto; border-radius: 8px;
+  background: #0d0d10; border: 1px solid #262c36; color: #e6e9ef;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; tab-size: 4;
+}
+.action-diff span.add, .action-diff span.del, .action-diff span.ctx { display: inline-block; min-width: 100%; padding: 0 12px; }
+.action-diff .add { background: rgba(70, 209, 154, 0.16); color: #7ee2b8; }
+.action-diff .del { background: rgba(255, 107, 107, 0.16); color: #ff9a9a; }
+.action-diff .ctx { color: #98a1b0; }
+.esc {
+  display: inline-block; padding: 0 4px; margin: 0 1px; border-radius: 4px; font-size: 0.85em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.3;
+  background: #5a2d82; color: #fff; border: 1px solid #b78cff; white-space: nowrap;
+}
+.action-error { margin: 0 0 8px; color: var(--danger); font-size: 14px; }
+.action-buttons { display: flex; align-items: center; gap: 8px; }
+.action-buttons .btn.approve { background: var(--accent); border-color: transparent; color: #1a0d08; font-weight: 600; }
+.action-buttons .btn.approve:hover:not(:disabled) { background: var(--accent-hover); }
+.action-buttons .btn { min-width: 110px; }
+.action-caption { margin-left: auto; }

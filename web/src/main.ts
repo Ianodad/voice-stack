@@ -1,7 +1,12 @@
 import { PipecatClient, type RTVIMessage } from "@pipecat-ai/client-js";
 import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 import "./style.css";
+import { ActionCard, RESULT_TEXT, type PublicAction } from "./actions";
 import {
+  ApiError,
+  approveAction,
+  denyAction,
+  pendingActions,
   deleteConversation,
   getConversation,
   listConversations,
@@ -22,6 +27,8 @@ const noticeEl = $("notice");
 const actionsEl = $("actions");
 const muteBtn = $<HTMLButtonElement>("mute-btn");
 const stopBtn = $<HTMLButtonElement>("stop-btn");
+const activityEl = $("activity");
+const card = new ActionCard($("action-card-host"), $("action-result"));
 
 let client: PipecatClient | null = null;
 let conn: Conn = "idle";
@@ -292,6 +299,8 @@ function attachBotAudio(track: MediaStreamTrack): void {
 }
 
 async function teardown(): Promise<void> {
+  card.clear();
+  clearActivity();
   stopBotAudio();
   const c = client;
   client = null;
@@ -357,6 +366,8 @@ async function connect(id: string | null): Promise<void> {
     callbacks: {
       onDisconnected: () => {
         if (gen !== generation || conn !== "live") return;
+        card.clear();
+        clearActivity();
         conn = "ended";
         showNotice("Session ended (opened in another tab or server stopped). Reconnect to continue.");
         render();
@@ -405,7 +416,9 @@ async function connect(id: string | null): Promise<void> {
       },
       onBotStoppedSpeaking: () => {
         if (phase === "speaking") setPhase(gen, "listening");
+        void resyncActions(gen);
       },
+      onServerMessage: (data: unknown) => handleServerMessage(gen, data),
       onLocalAudioLevel: (l: number) => {
         if (gen === generation && (phase === "listening" || phase === "userSpeaking") && !muted) {
           orb.setLevel(Math.min(1, l * 2));
@@ -453,6 +466,7 @@ async function connect(id: string | null): Promise<void> {
   conn = "live";
   phase = "listening";
   render();
+  void resyncActions(gen);
 
   // X-Conversation-Id is not readable via client-js: pick the newest one.
   try {
@@ -533,6 +547,148 @@ async function removeConversation(id: string): Promise<void> {
   render();
 }
 
+// ---------- assistant actions (confirmation card + tool activity) ----------
+
+const ACTIVITY_LABELS: Record<string, string> = {
+  web_search: "Searching the web\u2026",
+  fetch_page: "Reading a page\u2026",
+  list_dir: "Looking at your files\u2026",
+  find_file: "Looking at your files\u2026",
+  read_file: "Looking at your files\u2026",
+  file_info: "Looking at your files\u2026",
+  move_file: "Preparing a change\u2026",
+  edit_file: "Preparing a change\u2026",
+};
+const ACTIVITY_TIMEOUT_MS = 20000;
+let activityTimer: number | undefined;
+
+function clearActivity(): void {
+  window.clearTimeout(activityTimer);
+  activityEl.textContent = "";
+}
+
+function setActivity(name: string): void {
+  activityEl.textContent = ACTIVITY_LABELS[name] ?? "Working\u2026";
+  window.clearTimeout(activityTimer);
+  activityTimer = window.setTimeout(clearActivity, ACTIVITY_TIMEOUT_MS);
+}
+
+function asAction(v: unknown): PublicAction | null {
+  const a = v as Partial<PublicAction> | null;
+  if (!a || typeof a !== "object") return null;
+  if (typeof a.id !== "string" || !a.id) return null;
+  if (a.kind !== "move" && a.kind !== "edit") return null;
+  if (typeof a.summary !== "string") return null;
+  if (a.diff !== null && a.diff !== undefined && typeof a.diff !== "string") return null;
+  return {
+    id: a.id,
+    kind: a.kind,
+    summary: a.summary,
+    diff: a.diff ?? null,
+    expires_in: typeof a.expires_in === "number" ? a.expires_in : 300,
+  };
+}
+
+let resyncing = false;
+/** A card can exist server-side without the UI knowing: ask, and show the first one. */
+async function resyncActions(gen: number): Promise<void> {
+  if (resyncing || gen !== generation || conn !== "live" || card.isOpen) return;
+  resyncing = true;
+  try {
+    const list = await pendingActions();
+    if (gen !== generation || conn !== "live" || card.isOpen) return;
+    for (const item of list) {
+      const a = asAction(item);
+      if (a && card.show(a)) break;
+    }
+  } catch (e) {
+    console.warn("could not fetch pending actions", e);
+  } finally {
+    resyncing = false;
+  }
+}
+
+function resultFor(status: string, kind: PublicAction["kind"] | null, summary: unknown): string {
+  switch (status) {
+    case "done":
+      return kind === "edit" ? RESULT_TEXT.edited : kind === "move" ? RESULT_TEXT.moved : "Done.";
+    case "denied":
+      return RESULT_TEXT.denied;
+    case "expired":
+      return RESULT_TEXT.expired;
+    default:
+      return typeof summary === "string" && summary ? summary.slice(0, 200) : RESULT_TEXT.failed;
+  }
+}
+
+function handleServerMessage(gen: number, data: unknown): void {
+  if (gen !== generation) return;
+  const m = data as { type?: string; [k: string]: unknown } | null;
+  if (!m || typeof m !== "object") return;
+  switch (m.type) {
+    case "pending_action": {
+      const a = asAction(m.action);
+      if (!a) {
+        console.warn("malformed pending_action ignored");
+        return;
+      }
+      card.show(a); // never replaces a showing card; logs and ignores
+      return;
+    }
+    case "tool_activity":
+      if (typeof m.name !== "string") return;
+      if (m.state === "start") {
+        setActivity(m.name);
+      } else if (m.state === "end") {
+        clearActivity();
+        void resyncActions(gen);
+      }
+      return;
+    case "action_result": {
+      const status = String(m.status);
+      if (!["done", "denied", "expired", "failed"].includes(status) || typeof m.id !== "string") return;
+      if (card.currentId === m.id) {
+        const text = resultFor(status, card.currentKind, m.summary);
+        card.finish(true);
+        card.showResult(text);
+      } else {
+        card.markClosed(m.id);
+        card.showResult(resultFor(status, null, m.summary));
+      }
+      return;
+    }
+    case "actions_cleared":
+      card.clear();
+      return;
+  }
+}
+
+card.onDecision(async (id, decision) => {
+  try {
+    await (decision === "approve" ? approveAction(id) : denyAction(id));
+    if (card.currentId === id) {
+      const kind = card.currentKind;
+      card.finish(true);
+      card.showResult(decision === "deny" ? RESULT_TEXT.denied : kind === "edit" ? RESULT_TEXT.edited : RESULT_TEXT.moved);
+    }
+  } catch (e) {
+    if (card.currentId !== id) return;
+    if (e instanceof ApiError && (e.status === 404 || e.status === 409)) {
+      card.finish(true);
+      card.showResult(RESULT_TEXT.stale);
+    } else if (e instanceof ApiError && e.status === 422) {
+      card.finish(true);
+      card.showResult(e.detail);
+    } else if (e instanceof ApiError) {
+      card.reenable(e.detail || "Something went wrong. Try again.");
+    } else {
+      card.reenable("Network error \u2014 try again.");
+    }
+  }
+  void resyncActions(generation);
+});
+card.onExpired(() => void resyncActions(generation));
+
 // ---------- controls ----------
 
 function setMic(on: boolean): void {
@@ -572,6 +728,7 @@ function releasePtt(): void {
 
 window.addEventListener("keydown", (e) => {
   if (inTextField(e.target)) return;
+  if (card.handleKey(e)) return; // Enter/Esc while a confirmation is open (Esc never interrupts)
   if (e.key === "Escape") {
     if (conn === "live") {
       try {
