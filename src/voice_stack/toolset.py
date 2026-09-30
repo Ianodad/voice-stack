@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -58,6 +59,7 @@ def system_prompt(today: date, root: Path) -> str:
         "says yes in a later message may you call move_file to archive. "
         "Moving or editing a file needs the user's click: after move_file or edit_file, tell the user "
         "a confirmation card is on screen; the change has NOT happened yet, so never say it is done. "
+        "After move_file or edit_file, say only that a card is waiting for their approval; never say it is done, updated, or moved. "
         "Never claim a change happened unless the tool result says so. "
         "Speech transcripts may contain mishearings; if a request sounds misheard or unclear, ask "
         "briefly what they meant. "
@@ -100,6 +102,38 @@ def _schema() -> ToolsSchema:
 
 
 _ACTION_KEYS = {"move_file": ("move", ("src", "dst")), "edit_file": ("edit", ("path", "old_text", "new_text"))}
+_DELETE = re.compile(
+    r"\b(delet(e|es|ed|ing)|remov(e|es|ed|ing)|eras(e|es|ed|ing)|trash(es|ed|ing)?|"
+    r"get(s|ting)? rid|got rid|wip(e|es|ed|ing)|destroy(s|ed|ing)?)\b", re.I)
+_MOVE = re.compile(
+    r"\b(mov(e|es|ed|ing)|archiv(e|es|ed|ing)|renam(e|es|ed|ing)|put (it|them|that|this) in|"
+    r"relocat(e|es|ed|ing))\b", re.I)
+_NO_DELETE = {"error": "user_asked_to_delete",
+              "instruction": "There is no delete tool. Tell the user you cannot delete files and ask if "
+                             "they would like the file moved to archive/ instead."}
+
+
+def _last_user_text(context) -> str:
+    try:
+        for m in reversed(list(getattr(context, "messages", None) or [])):
+            if isinstance(m, dict) and m.get("role") == "user":
+                c = m.get("content")
+                if isinstance(c, str):
+                    return c
+                if isinstance(c, list):
+                    return " ".join(str(x.get("text", "")) for x in c
+                                    if isinstance(x, dict) and x.get("type") in (None, "text"))
+                return ""
+    except Exception:
+        pass
+    return ""
+
+
+def wants_delete_not_move(context) -> bool:
+    t = _last_user_text(context)
+    return bool(_DELETE.search(t)) and not _MOVE.search(t)
+
+
 _BUSY = ("A confirmation card is already on screen. Ask the user to confirm or deny that card "
          "first, then try again.")
 
@@ -127,12 +161,15 @@ def build(session: ToolSession) -> tuple[ToolsSchema, dict[str, Callable]]:
             return await asyncio.to_thread(tools.read_file, session.root, args.get("path", ""))
         if name == "file_info":
             return await asyncio.to_thread(tools.file_info, session.root, args.get("path", ""))
+        if name == "move_file" and wants_delete_not_move(params.context):
+            return dict(_NO_DELETE)
         kind, keys = _ACTION_KEYS[name]
         pa = {k: args[k] for k in keys if k in args}
         p = await asyncio.to_thread(session.pending.propose, session.session_id, kind, pa)
         await _push(params, {"type": "pending_action", "action": p.public()})
         return {"status": "awaiting_user_confirmation", "summary": p.summary,
-                "note": "A confirmation card is on screen. The change has NOT happened yet."}
+                "instruction": "NOT DONE YET. Tell the user a confirmation card is on screen and the change "
+                               "happens only after they click Approve. Do not say it is done, updated, or moved."}
 
     async def handler(params: FunctionCallParams) -> None:
         name = params.function_name
