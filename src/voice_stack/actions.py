@@ -7,6 +7,8 @@ Security model:
 - One pending action per session. Ids are single-use: `approve`/`deny` pop the
   id under a lock first, so concurrent approvals execute at most once.
 - Ids are bound to the session that proposed them; another session sees 404.
+- Approved actions execute strictly one at a time (separate execution lock); the
+  state lock is never held while applying or while writing the audit log.
 - Audit lines are ASCII-only JSON (control/bidi characters are escaped) and go
   to `root/.audit.jsonl`, which the file tools refuse to touch. An audit write
   failure is logged to stderr and never blocks or fails an action.
@@ -18,6 +20,7 @@ import copy
 import json
 import os
 import secrets
+import stat
 import sys
 import threading
 import time
@@ -61,16 +64,19 @@ class Pending:
     expires_in: float = 0.0
 
     def public(self) -> dict:
+        """Safe view for clients. `expires_in` is a snapshot taken when the copy was made."""
         return {"id": self.id, "kind": self.kind, "summary": self.summary,
                 "diff": self.diff, "expires_in": max(0, int(round(self.expires_in)))}
 
 
 class PendingActions:
-    def __init__(self, root: Path, clock: Callable[[], float] = time.time, ttl: float = 300.0):
+    def __init__(self, root: Path, clock: Callable[[], float] = time.monotonic, ttl: float = 300.0):
+        # `clock` drives expiry only (monotonic by default); audit stamps use wall time.
         self.root = Path(root)
         self._clock = clock
         self._ttl = float(ttl)
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # state lock: short, no I/O
+        self._exec_lock = threading.Lock()     # serialises apply_* calls
         self._audit_lock = threading.Lock()
         self._items: dict[str, Pending] = {}
         self._spent: OrderedDict[str, str] = OrderedDict()   # id -> session that owned it
@@ -78,19 +84,29 @@ class PendingActions:
     # ------------------------------------------------------------ audit
     def _audit(self, event: str, p: Pending | None = None, detail: str = "", *,
                id: str = "", kind: str = "") -> None:
+        """Never raises, never blocks (O_NONBLOCK + regular-file check). Do not call
+        while holding the state lock."""
         try:
-            rec = {"t": round(self._clock(), 3), "event": event,
+            rec = {"t": round(time.time(), 3), "event": event,
                    "id": p.id if p else id, "kind": p.kind if p else kind,
                    "summary": p.summary if p else "", "detail": str(detail)[:MAX_DETAIL_CHARS]}
             line = json.dumps(rec, ensure_ascii=True) + "\n"      # escapes control/bidi chars
             with self._audit_lock:
                 fd = os.open(self.root / AUDIT_NAME,
-                             os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-                with os.fdopen(fd, "a", encoding="ascii") as f:
-                    f.write(line)
-                    f.flush()
+                             os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK
+                             | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise OSError("audit path is not a regular file")
+                    os.write(fd, line.encode("ascii"))
+                finally:
+                    os.close(fd)
         except Exception as e:                                     # never block the action
             print(f"audit write failed: {type(e).__name__}: {e}", file=sys.stderr)
+
+    def _flush(self, events: list) -> None:
+        for ev, p, detail in events:
+            self._audit(ev, p, detail)
 
     # ------------------------------------------------------------ internals
     def _expired(self, p: Pending) -> bool:
@@ -101,11 +117,11 @@ class PendingActions:
         while len(self._spent) > SPENT_CAP:
             self._spent.popitem(last=False)
 
-    def _sweep_locked(self) -> None:
+    def _sweep_locked(self, events: list) -> None:
         for pid in [i for i, p in self._items.items() if self._expired(p)]:
             p = self._items.pop(pid)
             self._mark_spent(p)
-            self._audit("expire", p, "expired before a decision")
+            events.append(("expire", p, "expired before a decision"))
 
     def _view(self, p: Pending) -> Pending:
         """Caller-facing copy: mutating it cannot affect the stored plan."""
@@ -113,23 +129,27 @@ class PendingActions:
         return replace(p, plan=copy.deepcopy(p.plan), expires_in=left)
 
     def _take(self, action_id: str, session_id: str, verb: str) -> Pending:
-        """Pop the pending action for approve/deny, or raise. Runs the whole
-        decision under the lock so concurrent callers cannot both win."""
-        with self._lock:
-            p = self._items.get(action_id) if isinstance(action_id, str) else None
-            if p is None:
-                owner = self._spent.get(action_id) if isinstance(action_id, str) else None
-                if owner is not None and owner == session_id:
-                    raise ActionError(409, "that action was already used or has expired")
-                raise ActionError(404, "no such pending action")
-            if p.session_id != session_id:
-                raise ActionError(404, "no such pending action")      # pending stays put
-            del self._items[action_id]
-            self._mark_spent(p)
-            if self._expired(p):
-                self._audit("expire", p, f"expired before {verb}")
-                raise ActionError(409, "that action expired")
-            return p
+        """Pop the pending action for approve/deny, or raise. The decision is made
+        under the state lock so concurrent callers cannot both win."""
+        events: list = []
+        try:
+            with self._lock:
+                p = self._items.get(action_id) if isinstance(action_id, str) else None
+                if p is None:
+                    owner = self._spent.get(action_id) if isinstance(action_id, str) else None
+                    if owner is not None and owner == session_id:
+                        raise ActionError(409, "that action was already used or has expired")
+                    raise ActionError(404, "no such pending action")
+                if p.session_id != session_id:
+                    raise ActionError(404, "no such pending action")      # pending stays put
+                del self._items[action_id]
+                self._mark_spent(p)
+                if self._expired(p):
+                    events.append(("expire", p, f"expired before {verb}"))
+                    raise ActionError(409, "that action expired")
+                return p
+        finally:
+            self._flush(events)
 
     # ------------------------------------------------------------ API
     def propose(self, session_id: str, kind: str, args: dict) -> Pending:
@@ -147,30 +167,48 @@ class PendingActions:
                 raise ActionError(400, f"{k} must be text")
             if len(args[k]) > MAX_ARG_CHARS:
                 raise ActionError(400, f"{k} is too large")
-        with self._lock:
-            self._sweep_locked()
-            if any(p.session_id == session_id for p in self._items.values()):
-                raise ActionError(429, "confirm or deny the card on screen first")
-            if kind == "move":
-                plan = tools.plan_move(self.root, args["src"], args["dst"])
-            else:
-                plan = tools.plan_edit(self.root, args["path"], args["old_text"], args["new_text"])
-            pid = secrets.token_urlsafe(8)
-            while pid in self._items or pid in self._spent:
+        self._check_slot(session_id)
+        # plan outside the state lock (fuzzy lookup can be slow)
+        if kind == "move":
+            plan = tools.plan_move(self.root, args["src"], args["dst"])
+        else:
+            plan = tools.plan_edit(self.root, args["path"], args["old_text"], args["new_text"])
+        events: list = []
+        try:
+            with self._lock:
+                self._sweep_locked(events)
+                if any(p.session_id == session_id for p in self._items.values()):
+                    raise ActionError(429, "confirm or deny the card on screen first")
                 pid = secrets.token_urlsafe(8)
-            p = Pending(id=pid, session_id=session_id, kind=kind, plan=copy.deepcopy(plan),
-                        summary=str(plan.get("summary", "")), diff=plan.get("diff"),
-                        created_at=self._clock())
-            self._items[pid] = p
-            self._audit("propose", p, p.diff or "")
-            return self._view(p)
+                while pid in self._items or pid in self._spent:
+                    pid = secrets.token_urlsafe(8)
+                p = Pending(id=pid, session_id=session_id, kind=kind, plan=copy.deepcopy(plan),
+                            summary=str(plan.get("summary", "")), diff=plan.get("diff"),
+                            created_at=self._clock())
+                self._items[pid] = p
+                events.append(("propose", p, p.diff or ""))
+                view = self._view(p)
+        finally:
+            self._flush(events)
+        return view
+
+    def _check_slot(self, session_id: str) -> None:
+        events: list = []
+        try:
+            with self._lock:
+                self._sweep_locked(events)
+                if any(p.session_id == session_id for p in self._items.values()):
+                    raise ActionError(429, "confirm or deny the card on screen first")
+        finally:
+            self._flush(events)
 
     def approve(self, action_id: str, session_id: str) -> dict:
         p = self._take(action_id, session_id, "approval")
         self._audit("approve", p)
         try:
-            result = tools.apply_move(self.root, copy.deepcopy(p.plan)) if p.kind == "move" \
-                else tools.apply_edit(self.root, copy.deepcopy(p.plan))
+            with self._exec_lock:       # one approved action at a time; state lock NOT held
+                result = tools.apply_move(self.root, copy.deepcopy(p.plan)) if p.kind == "move" \
+                    else tools.apply_edit(self.root, copy.deepcopy(p.plan))
         except ToolError as e:
             self._audit("execute_fail", p, str(e))
             raise ActionError(422, str(e)) from e
@@ -185,15 +223,20 @@ class PendingActions:
         self._audit("deny", p)
 
     def discard_session(self, session_id: str) -> int:
+        events: list = []
         with self._lock:
             gone = [p for p in self._items.values() if p.session_id == session_id]
             for p in gone:
                 del self._items[p.id]
                 self._mark_spent(p)
-                self._audit("discard", p, "session ended")
-            return len(gone)
+                events.append(("discard", p, "session ended"))
+        self._flush(events)
+        return len(gone)
 
     def list(self, session_id: str) -> list[dict]:
+        events: list = []
         with self._lock:
-            self._sweep_locked()
-            return [self._view(p).public() for p in self._items.values() if p.session_id == session_id]
+            self._sweep_locked(events)
+            out = [self._view(p).public() for p in self._items.values() if p.session_id == session_id]
+        self._flush(events)
+        return out

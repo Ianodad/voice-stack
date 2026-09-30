@@ -1,4 +1,4 @@
-import tempfile, threading, json
+import tempfile, threading, json, os, time, inspect
 from pathlib import Path
 from voice_stack.actions import PendingActions, ActionError
 from voice_stack import tools as T
@@ -118,4 +118,57 @@ with tempfile.TemporaryDirectory() as d:
     assert pa.approve(p.id, "S")["status"] == "done" and (root/"sub/a.txt").exists()
 # forged plan dict cannot be smuggled in: approve takes only ids
 import inspect; assert list(inspect.signature(PendingActions.approve).parameters) == ["self", "action_id", "session_id"]
+# ---- fix round 1
+# (I1) two sessions editing the same file concurrently: never "done" while losing an edit
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d).resolve(); pa = PendingActions(root)
+    for trial in range(15):
+        (root/"shared.txt").write_text("one two\n")
+        u1 = pa.propose("U1", "edit", {"path": "shared.txt", "old_text": "one", "new_text": "1"})
+        u2 = pa.propose("U2", "edit", {"path": "shared.txt", "old_text": "two", "new_text": "2"})
+        out = {}
+        def go(sid, aid):
+            try: out[sid] = pa.approve(aid, sid)["status"]
+            except ActionError as e: out[sid] = e.status
+        ts = [threading.Thread(target=go, args=a) for a in (("U1", u1.id), ("U2", u2.id))]
+        [t.start() for t in ts]; [t.join() for t in ts]
+        txt = (root/"shared.txt").read_text()
+        if out["U1"] == "done" and out["U2"] == "done": assert txt == "1 2\n", (out, txt)
+        else: assert 422 in out.values() and "done" in out.values(), (out, txt)
+    assert inspect.signature(PendingActions.__init__).parameters["clock"].default is time.monotonic
+# (I2a) N threads proposing for one session: exactly one wins, rest 429
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d).resolve(); pa = PendingActions(root)
+    for i in range(8): (root/f"f{i}.txt").write_text("x")
+    res = []
+    def prop(i):
+        try: pa.propose("SS", "move", {"src": f"f{i}.txt", "dst": f"out/f{i}.txt"}); res.append("ok")
+        except ActionError as e: res.append(e.status)
+    ts = [threading.Thread(target=prop, args=(i,)) for i in range(8)]; [t.start() for t in ts]; [t.join() for t in ts]
+    assert res.count("ok") == 1 and res.count(429) == 7 and len(pa.list("SS")) == 1, res
+# (I2b) FIFO at .audit.jsonl: nothing blocks, approval still works
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d).resolve(); os.mkfifo(root/".audit.jsonl"); (root/"a.txt").write_text("a")
+    pa = PendingActions(root); box = {}
+    def work():
+        box["p"] = pa.propose("F", "move", {"src": "a.txt", "dst": "sub/a.txt"})
+        box["l"] = pa.list("OTHER"); box["r"] = pa.approve(box["p"].id, "F")["status"]
+    t = threading.Thread(target=work, daemon=True); t.start(); t.join(5)
+    assert not t.is_alive() and box.get("r") == "done" and box["l"] == [], box
+# (M1) expiry follows the injected clock, audit stamp is wall time
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d).resolve(); (root/"a.txt").write_text("a"); clk = Clock(); pa = PendingActions(root, clock=clk)
+    pa.propose("W", "move", {"src": "a.txt", "dst": "b.txt"})
+    t0 = json.loads((root/".audit.jsonl").read_text().splitlines()[0])["t"]; assert abs(t0 - time.time()) < 60
+# (M4) tools hide the audit file in every spelling
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d).resolve(); (root/"a.txt").write_text("a"); (root/".audit.jsonl").write_text("{}\n")
+    for name in (".audit.jsonl", ".AUDIT.JSONL"):
+        for fn in (lambda: T.read_file(root, name), lambda: T.file_info(root, name),
+                   lambda: T.plan_move(root, name, "x.txt"), lambda: T.plan_move(root, "a.txt", name),
+                   lambda: T.plan_edit(root, name, "{", "x")):
+            try: fn(); raise AssertionError(f"tool reached {name}")
+            except T.ToolError: pass
+    assert ".audit.jsonl" not in [e["name"] for e in T.list_dir(root)]
+    assert all("audit" not in x.lower() for x in T.find_file(root, ".audit.jsonl"))
 print("check_actions.py: PASS")
