@@ -3,8 +3,11 @@
 from collections.abc import Callable
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import LLMFullResponseStartFrame, LLMTextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.frame_processor import FrameProcessor
+from pipecat.processors.frameworks.rtvi import RTVIObserverParams
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -21,6 +24,49 @@ from voice_stack.runtime import (
 )
 from voice_stack.stt import ParakeetSTTService
 from voice_stack.tts import MLXKokoroTTSService
+
+
+class ReplyTap(FrameProcessor):
+    """Pass-through between llm and tts: remembers the exact LLM text of the
+    current reply (code in its true position, no spoken cue)."""
+
+    def __init__(self):
+        super().__init__()
+        self.full = ""
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self.full = ""
+        elif isinstance(frame, LLMTextFrame):
+            self.full += frame.text
+        await self.push_frame(frame, direction)
+
+
+def reply_content(tap: ReplyTap, context: LLMContext, message) -> str:
+    """Content to store for a finished assistant turn. When the reply had a
+    code fence and was not interrupted, the aggregator context holds the code
+    out of order and the spoken cue; rewrite the last assistant message to the
+    exact full reply. Otherwise return message.content unchanged."""
+    if "```" not in tap.full or message.interrupted:
+        return message.content
+    full = tap.full.strip()
+    for msg in reversed(context.messages):
+        if msg.get("role") == "assistant":
+            msg["content"] = full
+            break
+    return full
+
+
+def make_assistant_turn_handler(
+    tap: ReplyTap, context: LLMContext, on_turn: Callable[[str, str], None] | None
+):
+    async def _on_assistant_turn_stopped(aggregator, message):
+        content = reply_content(tap, context, message)
+        if on_turn is not None and content and content.strip():
+            on_turn("assistant", content)
+
+    return _on_assistant_turn_stopped
 
 
 def build_worker(
@@ -67,6 +113,11 @@ def build_worker(
         # user_turn_strategies left at default -> LocalSmartTurnAnalyzerV3, on-device.
     )
 
+    reply_tap = ReplyTap()
+    assistant_agg.event_handler("on_assistant_turn_stopped")(
+        make_assistant_turn_handler(reply_tap, context, on_turn)
+    )
+
     if on_turn is not None:
 
         @user_agg.event_handler("on_user_turn_stopped")
@@ -74,13 +125,8 @@ def build_worker(
             if message.content and message.content.strip():
                 on_turn("user", message.content)
 
-        @assistant_agg.event_handler("on_assistant_turn_stopped")
-        async def _on_assistant_turn_stopped(aggregator, message):
-            if message.content and message.content.strip():
-                on_turn("assistant", message.content)
-
     pipeline = Pipeline(
-        [transport.input(), stt, user_agg, llm, tts, transport.output(), assistant_agg]
+        [transport.input(), stt, user_agg, llm, reply_tap, tts, transport.output(), assistant_agg]
     )
     worker = PipelineWorker(
         pipeline,
@@ -89,5 +135,7 @@ def build_worker(
         ),
         # Local assistant waits indefinitely; default 300s idle timeout exits it.
         idle_timeout_secs=None,
+        # The spoken "code is on screen" cue is hidden from the client.
+        rtvi_observer_params=RTVIObserverParams(skip_aggregator_types=["cue"]),
     )
     return worker, context

@@ -25,6 +25,8 @@ from pipecat.frames.frames import Frame, TTSAudioRawFrame
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 
+from voice_stack.fence import CODE_CUE, FenceAggregator
+
 
 class MLXKokoroTTSService(TTSService):
     """Local TTS via mlx-audio's Kokoro, run on a shared MLX executor thread."""
@@ -44,12 +46,20 @@ class MLXKokoroTTSService(TTSService):
         # above, not the Language-enum-based settings field (see
         # pipecat/services/settings.py -- None marks a store-mode field as
         # unsupported rather than leaving it NOT_GIVEN).
+        # Fenced code is never spoken: type "code" is skipped by TTS (it still
+        # flows downstream to the client and LLM context).
+        kwargs.setdefault("skip_aggregator_types", ["code"])
         super().__init__(
             push_start_frame=True,
             push_stop_frames=True,
             sample_rate=24000,
             settings=TTSSettings(model=model_id, voice=voice, language=None),
             **kwargs,
+        )
+        # Same pattern as pipecat's Cartesia/Rime services: swap the base
+        # SimpleTextAggregator after init.
+        self._text_aggregator = FenceAggregator(
+            cue=CODE_CUE, aggregation_type=self._text_aggregation_mode
         )
         self._executor = executor
         self._voice = voice

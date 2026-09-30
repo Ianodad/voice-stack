@@ -397,8 +397,10 @@ async function connect(id: string | null): Promise<void> {
       onUserStoppedSpeaking: () => {
         if (phase === "userSpeaking") setPhase(gen, "thinking");
       },
+      // Bot output (prose + code) arrives before audio starts, so the turn
+      // boundary is the LLM response start, not "started speaking".
+      onBotLlmStarted: () => transcript.startBotTurn(),
       onBotStartedSpeaking: () => {
-        transcript.startBotTurn();
         setPhase(gen, "speaking");
       },
       onBotStoppedSpeaking: () => {
@@ -415,8 +417,10 @@ async function connect(id: string | null): Promise<void> {
       onUserTranscript: (d) => {
         if (gen === generation && d.final && d.text.trim()) transcript.addUser(d.text.trim());
       },
-      onBotTtsText: (d) => {
-        if (gen === generation && d.text.trim()) transcript.appendBot(d.text);
+      // Each sentence arrives twice (spoken=false before TTS, spoken=true
+      // after); render the early one so prose and code keep their order.
+      onBotOutput: (d) => {
+        if (gen === generation) transcript.botOutput(d);
       },
     },
   });

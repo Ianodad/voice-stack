@@ -37,12 +37,23 @@ LLM_PORT = 8080
 # (same reasoning as scripts/latency_spike.py's run_llm).
 ENABLE_THINKING_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 
+# Spoken replies must never contain code: the UI shows the fenced block in a
+# code box (the TTS skips it) and only the plain-English explanation is spoken.
+CODE_RULES = (
+    "When the user asks for code, reply with ONE short lead-in sentence, then the code in "
+    "a single fenced block with a language tag (for example ```python), then explain the "
+    "code in plain English in short sentences: one sentence per main step, about 4-8 "
+    "sentences, no symbols read out, never repeating the code in the explanation. The "
+    "1-3 sentence limit applies to everything except that code explanation. Code is shown "
+    "on screen and not spoken aloud; use fenced blocks only for code."
+)
 SYSTEM_PROMPT = (
     "You are a concise voice assistant running entirely locally on the user's Mac "
     "(Apple Silicon): speech-to-text, this language model (Qwen3.6), and text-to-speech "
     "all run on-device, with no internet or cloud access. You cannot open apps or browse. "
     "Speech transcripts may contain mishearings; if a request is unclear, ask briefly. "
-    "Reply in 1-3 short sentences, no markdown."
+    "Reply in 1-3 short sentences, no markdown. "
+    + CODE_RULES
 )
 WARMUP_USER_TEXT = "Say hello in one short sentence."
 CHECK_USER_TEXT = "What is two plus two?"
