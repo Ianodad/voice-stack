@@ -1,6 +1,7 @@
 """Pipeline factory: builds one per-session PipelineWorker from a Runtime."""
 
 from collections.abc import Callable
+from datetime import date
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMFullResponseStartFrame, LLMTextFrame
@@ -15,6 +16,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.turns.user_mute import AlwaysUserMuteStrategy
 
+from voice_stack import toolset
 from voice_stack.runtime import (
     STT_MODEL_ID,
     TTS_LANG_CODE,
@@ -51,8 +53,16 @@ def reply_content(tap: ReplyTap, context: LLMContext, message) -> str:
     if "```" not in tap.full or message.interrupted:
         return message.content
     full = tap.full.strip()
+    # Match the message holding THIS turn's spoken text. With tool calls the
+    # last assistant message can be a tool_calls message; never touch those.
+    spoken = (message.content or "").strip()
     for msg in reversed(context.messages):
-        if msg.get("role") == "assistant":
+        if (
+            msg.get("role") == "assistant"
+            and not msg.get("tool_calls")
+            and isinstance(msg.get("content"), str)
+            and msg["content"].strip() == spoken
+        ):
             msg["content"] = full
             break
     return full
@@ -76,6 +86,7 @@ def build_worker(
     *,
     mute_while_bot_speaks: bool,
     on_turn: Callable[[str, str], None] | None = None,
+    tools: "toolset.ToolSession | None" = None,
 ) -> tuple[PipelineWorker, LLMContext]:
     """Build a fresh STT/TTS/LLM pipeline around `transport`, reusing the
     runtime's preloaded models. `messages` is prior {role, content} history.
@@ -92,12 +103,20 @@ def build_worker(
         lang_code=TTS_LANG_CODE,
         model=runtime.tts_model,
     )
-    llm = runtime.make_llm()
+    if tools is None:
+        llm = runtime.make_llm()
+        context = LLMContext()
+    else:
+        llm = runtime.make_llm(
+            system_instruction=toolset.system_prompt(date.today(), tools.root)
+        )
+        schema, handlers = toolset.build(tools)
+        toolset.register(llm, handlers)
+        context = LLMContext(tools=schema)
 
     # system_instruction (in make_llm) replaces the old initial "system"
     # message in context (base_llm.py's system_instruction path was deprecated
     # in 1.9.0 for the latter).
-    context = LLMContext()
     if messages:
         context.set_messages(messages)
     user_agg, assistant_agg = LLMContextAggregatorPair(
@@ -118,6 +137,12 @@ def build_worker(
         make_assistant_turn_handler(reply_tap, context, on_turn)
     )
 
+    if tools is not None:
+
+        @user_agg.event_handler("on_user_turn_started")
+        async def _on_user_turn_started(aggregator, strategy):
+            tools.reset_turn()
+
     if on_turn is not None:
 
         @user_agg.event_handler("on_user_turn_stopped")
@@ -137,5 +162,6 @@ def build_worker(
         idle_timeout_secs=None,
         # The spoken "code is on screen" cue is hidden from the client.
         rtvi_observer_params=RTVIObserverParams(skip_aggregator_types=["cue"]),
+        app_resources=tools,
     )
     return worker, context

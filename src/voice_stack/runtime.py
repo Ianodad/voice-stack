@@ -136,13 +136,13 @@ class Runtime:
     def llm_base_url(self) -> str:
         return self.llm_server.base_url
 
-    def make_llm(self) -> OpenAILLMService:
+    def make_llm(self, system_instruction: str | None = None) -> OpenAILLMService:
         llm = OpenAILLMService(
             base_url=self.llm_base_url,
             api_key="not-needed",
             settings=OpenAILLMService.Settings(
                 model=LLM_MODEL_ID,
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=system_instruction or SYSTEM_PROMPT,
                 extra={"extra_body": ENABLE_THINKING_EXTRA_BODY},
             ),
         )

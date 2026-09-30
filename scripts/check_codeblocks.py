@@ -314,6 +314,28 @@ async def main():
     assert " ".join(spoken).replace(CODE_CUE, "").split() == "Sure. Here: done.".split(), spoken
     assert turns == [("assistant", "Sure. Here: ```bash\nls\n``` done.")], turns
     print("round 2 ok")
+
+    # 3. tool-call messages: a tool_calls assistant message after the text message
+    # must never be overwritten by the code-block context rewrite.
+    from types import SimpleNamespace
+    from voice_stack.bot import reply_content
+    tap = ReplyTap()
+    tap.full = "Sure. Here: ```bash\nls\n``` done."
+    tc = {"role": "assistant", "content": None, "tool_calls": [{"id": "1", "type": "function",
+          "function": {"name": "list_dir", "arguments": "{}"}}]}
+    ctx = LLMContext(messages=[
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "Sure. Here: " + CODE_CUE + " done."},
+        tc, {"role": "tool", "tool_call_id": "1", "content": "{}"}])
+    before = [dict(m) for m in ctx.messages]
+    out = reply_content(tap, ctx, SimpleNamespace(content="Sure. Here: " + CODE_CUE + " done.", interrupted=False))
+    assert out == tap.full.strip() and ctx.messages[1]["content"] == tap.full.strip(), ctx.messages
+    assert ctx.messages[2] == before[2] and ctx.messages[3] == before[3], ctx.messages
+    # no matching text message at all: nothing is overwritten
+    ctx2 = LLMContext(messages=[{"role": "user", "content": "q"}, dict(tc)])
+    reply_content(tap, ctx2, SimpleNamespace(content="something else", interrupted=False))
+    assert ctx2.messages[1] == tc, ctx2.messages
+    print("tool-call context ok")
     print("PASS")
 
 
