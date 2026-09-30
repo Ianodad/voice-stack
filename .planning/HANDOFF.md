@@ -1,11 +1,12 @@
-## Handoff — Opus — voice-stack / Web UI built, awaiting live test
+## Handoff — Opus — voice-stack / assistant tools + code blocks (paused: usage limit)
 
-Current State: web UI implemented (Tasks 1-4 + final fix wave) on branch phase/web-ui, tracking origin/main (public repo Ianodad/voice-stack). HEAD ecea8ac-equivalent (hashes rewritten by filter-repo 2026-09-29; live-run logs scrubbed from history; backup ~/voice-stack-backup-2026-09-29.bundle). Latest commit local only, NOT pushed.
-
-Done: history.py (SQLite), runtime.py + bot.py (extracted), server.py (FastAPI, WebRTC, Origin/Host guard), web/ (Vite TS orb UI), bot audio playback fix, README. Reviews: Sonnet xhigh per task + Opus final (Codex out of quota until Oct 3). Checks: scripts/check_{history,web,stt,tts}.py, `uv run voice-stack --check` PASS.
-
-Remaining (user, on speakers): 1) `(cd web && npm ci && npm run build)`; `uv run voice-stack web`; open http://localhost:7860, hear bot, interrupt by voice, check no self-hearing. 2) hold Space while muted. 3) `pkill -f mlx_lm.server` mid-chat -> Restart LLM. Then record STT/LLM/TTS TTFB in docs/BENCHMARK.md.
-Then: push, add LICENSE (MIT recommended), merge phase/web-ui -> feature/voice-loop-mvp only on user go.
-
-Open Flags: Safari play() rejection not retried; botTtsText-before-botStarted could split a line; Space on other focused buttons; scripts/spike_input.wav (user's voice?) is in the public repo; no LICENSE.
-Resume instruction: ask user for live-test results, fix what breaks, then push.
+State: branch phase/web-ui (local HEAD ahead of origin/main; last push 68ce9b3). Plan: docs/superpowers/plans/2026-09-30-assistant-tools.md. SDD ledger: .superpowers/sdd/2026-09-30-assistant-tools/progress.md (git-ignored).
+Done+reviewed: T1 tools.py (+display escaping f637dff), T2 actions.py, T3 web.py, T4a toolset/bot wiring, B1 code-block box+Copy (fence.py etc).
+Built, review findings OPEN:
+- T4b server routes (98b805f): Opus review done, no Critical. Needs ONE fix round: I1 card_shown flag → shown_id; I2 push action_result 'failed' + fixed spoken line on 422; I3 speak fixed 'Done. I moved the file.' (no file names, it enters LLM context); M1 require application/json on POST /api/actions/*; M5 root mkdir 0700; test fixes (hang-on-fail, mutation-killing test for discard order, assert 404 only). Then Step 4b-3 checks with :8080 stopped: full check_toolcalls.py live, voice-stack --check, pgrep=0, SIGINT leak check, check_web restart sections.
+- T5 card UI (813c788): Opus review found CRITICAL C1 (off-screen payload) + I1-I5 + minors. THE FIX MESSAGE WAS SENT TO THE WRONG AGENT and never applied — re-dispatch the Task 5 implementer with the contract: server now escapes backslash as \\, hidden chars \uxxxx/\Uxxxxxxxx (lowercase), tab \t (tools.py f637dff); client must PARSE not re-escape; wrap long lines + space-run chips; bidi-override ltr; clip marks; arm delay only while visible+focused+in viewport; scroll-to-end before Approve; hunk count; Esc hold must not interrupt; etc. (full list in progress.md 'Task 5 review').
+Not yet done: fix rounds above, re-reviews, T6 live acceptance + README/BENCHMARK, final whole-branch Opus review, push.
+IMPORTANT: the running `voice-stack web` process (:7860) is OLD (pre-tools). Restart it (Ctrl-C, `cd web && npm run build`, `uv run voice-stack web`) to get tools; ~/VoiceAssistant is the sandbox folder.
+Blog: Blog/Ready-to-Post/Talk to an AI on Your Own Laptop… (+ Remotion animations in Blog/img); needs Medium publish then fill [link] in 3 social posts.
+Open flags: Codex quota out until 2026-10-03; repo public (Ianodad/voice-stack); history was rewritten 2026-09-29 (backup ~/voice-stack-backup-2026-09-29.bundle); spike_input.wav in repo; unpushed commits include auto-backup-named commits.
+Resume: re-dispatch T5 fix, then T4b fix round, re-review both, T6, final review.
