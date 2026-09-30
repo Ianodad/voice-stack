@@ -12,7 +12,10 @@ Fetch safety model:
 from __future__ import annotations
 
 import asyncio
+import codecs
 import ipaddress
+import logging
+import time
 import re
 import socket
 import unicodedata
@@ -32,17 +35,66 @@ MAX_QUERY_LEN = 300
 USER_AGENT = "Mozilla/5.0 (compatible; voice-stack-assistant/0.1)"
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+ALLOWED_PORTS = frozenset({80, 443, 8080, 8443})  # deliberate: no SSH/SMTP/DB/etc. ports even on public IPs
+MAX_EXTRACT_CHARS = 512 * 1024  # HTML fed to trafilatura
+TITLE_SCAN_CHARS = 64 * 1024
 _NUMERIC_LABEL = re.compile(r"^(?:0x[0-9a-f]*|\d+)$", re.I)
 _STRICT_NUMERIC_LABEL = re.compile(r"^(?:0x[0-9a-f]+|\d+)$", re.I)
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _BLOCKED_SUFFIXES = (".localhost", ".local", ".internal", ".localdomain", ".home.arpa", ".in-addr.arpa", ".ip6.arpa")
-_ZERO_WIDTH = re.compile("[​-‏‪-‮⁠-⁤﻿]")
 
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 _NAT64_LOCAL = ipaddress.ip_network("64:ff9b:1::/48")
 _6TO4 = ipaddress.ip_network("2002::/16")
 _TEREDO = ipaddress.ip_network("2001::/32")
 _V4_COMPAT = ipaddress.ip_network("::/96")
+
+
+_log = logging.getLogger(__name__)
+_GLOBAL_V6 = ipaddress.ip_network("2000::/3")
+_LOCAL_TTL = 30.0
+_local_cache: tuple[float, list] = (0.0, [])
+
+
+def _local_addresses() -> list:
+    """This machine's own interface addresses (cached ~30 s).
+
+    Tests replace this function wholesale (monkeypatch `web._local_addresses`); it is deliberately
+    NOT a production parameter. Enumeration failure is logged and treated as 'none known'.
+    """
+    global _local_cache
+    now = time.monotonic()
+    if _local_cache[1] and now - _local_cache[0] < _LOCAL_TTL:
+        return _local_cache[1]
+    out: list = []
+    try:
+        import psutil
+        for addrs in psutil.net_if_addrs().values():
+            for a in addrs:
+                if a.family in (socket.AF_INET, socket.AF_INET6):
+                    try:
+                        out.append(ipaddress.ip_address(a.address.split("%", 1)[0]))
+                    except ValueError:
+                        pass
+    except Exception:
+        _log.warning("could not enumerate local interface addresses", exc_info=True)
+    _local_cache = (now, out)
+    return out
+
+
+def _is_local(ip) -> bool:
+    """True if `ip` is one of our own addresses, or shares a /64 with one of our global IPv6 addresses."""
+    try:
+        local = _local_addresses()
+    except Exception:
+        _log.warning("local address provider failed", exc_info=True)
+        return False
+    for la in local:
+        if ip == la:
+            return True
+        if ip.version == 6 and la.version == 6 and la in _GLOBAL_V6 and (int(ip) >> 64) == (int(la) >> 64):
+            return True
+    return False
 
 
 class WebError(Exception):
@@ -61,6 +113,10 @@ def _is_public(ip) -> bool:
             return _is_public(ipaddress.IPv4Address(ip.packed[2:6]))
         if ip in _NAT64_LOCAL or ip in _TEREDO or ip in _V4_COMPAT:
             return False
+        if ip not in _GLOBAL_V6:  # fec0::/10 site-local, fc00::/7, fe80::/10, ... only 2000::/3 is public unicast
+            return False
+    if _is_local(ip):
+        return False
     return bool(
         ip.is_global
         and not (ip.is_multicast or ip.is_loopback or ip.is_private or ip.is_link_local
@@ -103,8 +159,8 @@ def _parse(url) -> tuple[str, str, int, str, object | None]:
         raise _bad("invalid port")
     if port is None:
         port = _DEFAULT_PORTS[scheme]
-    if not 1 <= port <= 65535:
-        raise _bad("invalid port")
+    if port not in ALLOWED_PORTS:
+        raise _bad("port not allowed (only 80, 443, 8080, 8443)")
     try:
         host = parts.hostname
     except ValueError:
@@ -264,29 +320,50 @@ async def _read_body(resp: httpx.Response) -> tuple[bytes, bool]:
 
 def _charset(content_type: str) -> str:
     m = re.search(r"charset\s*=\s*[\"']?([\w.:-]+)", content_type, re.I)
-    return m.group(1) if m else "utf-8"
+    name = m.group(1) if m else "utf-8"
+    try:
+        info = codecs.lookup(name)
+        if not getattr(info, "_is_text_encoding", True):  # idna, rot13, base64, zlib, ...
+            return "utf-8"
+        return info.name
+    except (LookupError, ValueError, TypeError):
+        return "utf-8"
 
 
 def _decode(body: bytes, content_type: str) -> str:
     try:
         return body.decode(_charset(content_type), errors="replace")
-    except LookupError:
+    except (LookupError, UnicodeError, ValueError, TypeError):
         return body.decode("utf-8", errors="replace")
+
+
+_TITLE_RE = re.compile(r"<title[^>]{0,256}>([^<]{0,1000})", re.I)
+
+
+def _title(html: str) -> str:
+    import html as _html
+    m = _TITLE_RE.search(html[:TITLE_SCAN_CHARS])
+    return _clean(_html.unescape(m.group(1))) if m else ""
+
+
+def _clean(s: str) -> str:
+    """Drop control / format (bidi, zero-width, tag) chars; collapse whitespace."""
+    s = "".join(c if c in "\n" or unicodedata.category(c) not in ("Cc", "Cf") else " " for c in s)
+    return " ".join(s.split())
 
 
 def _extract(html: str) -> tuple[str, str]:
     import trafilatura
+    html = html[:MAX_EXTRACT_CHARS]
     text = trafilatura.extract(html, include_comments=False) or ""
-    import html as _html
-    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
-    title = _html.unescape(m.group(1)) if m else ""
-    if not title.strip():
+    title = _title(html)
+    if not title:
         try:
             meta = trafilatura.extract_metadata(html)
-            title = (meta.title or "") if meta is not None else ""
+            title = _clean((meta.title or "") if meta is not None else "")
         except Exception:
             title = ""
-    return text, " ".join(title.split())
+    return text, title
 
 
 async def _fetch_chain(url: str, client: httpx.AsyncClient, resolver: Callable) -> tuple[str, str, bytes, bool]:
@@ -311,7 +388,7 @@ async def _fetch_chain(url: str, client: httpx.AsyncClient, resolver: Callable) 
             ctype = resp.headers.get("content-type", "")
             media = ctype.split(";", 1)[0].strip().lower()
             if media not in ("text/html", "text/plain"):
-                raise WebError(f"fetch_failed: unsupported content type '{media[:60] or 'none'}'")
+                raise WebError(f"fetch_failed: unsupported content type '{re.sub(r'[^A-Za-z0-9/+.-]', '', media)[:60] or 'none'}'")
             body, truncated = await _read_body(resp)
             return current, ctype, body, truncated
         finally:
@@ -321,36 +398,46 @@ async def _fetch_chain(url: str, client: httpx.AsyncClient, resolver: Callable) 
 
 async def fetch_page(url: str, *, client: httpx.AsyncClient | None = None,
                      resolver: Callable = socket.getaddrinfo, max_chars: int = MAX_CHARS) -> dict:
-    """Fetch one page as plain text. Keys: url, title, text, truncated (+ note when no text)."""
-    max_chars = max(1, min(int(max_chars), MAX_CHARS))
+    """Fetch one page as plain text. Keys: url, title, text, truncated (+ note when no text).
+
+    Only raises WebError. `client` is for tests with a MockTransport only (production passes none);
+    a client that follows redirects or reads proxy env vars would bypass per-hop vetting / pinning, so it is refused.
+    """
+    try:
+        max_chars = max(1, min(int(max_chars), MAX_CHARS))
+    except (TypeError, ValueError, OverflowError):
+        raise WebError("invalid_request: max_chars must be an integer")
     own = client is None
+    if not own and (client.follow_redirects or client.trust_env):
+        raise WebError("invalid_client: injected client must have follow_redirects=False and trust_env=False")
     if own:
         # trust_env=False: never route through an env proxy (that would defeat IP pinning)
         client = httpx.AsyncClient(timeout=httpx.Timeout(TOTAL_TIMEOUT), follow_redirects=False, trust_env=False,
                                    limits=httpx.Limits(max_connections=2, max_keepalive_connections=0))
     try:
         try:
-            async with asyncio.timeout(TOTAL_TIMEOUT):
+            async with asyncio.timeout(TOTAL_TIMEOUT):  # one deadline: network AND extraction
                 final_url, ctype, body, truncated = await _fetch_chain(url, client, resolver)
+                decoded = _decode(body, ctype).replace("\x00", "")
+                media = ctype.split(";", 1)[0].strip().lower()
+                if media == "text/plain":
+                    text, title = decoded.strip(), ""
+                else:
+                    try:
+                        text, title = await asyncio.to_thread(_extract, decoded)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        text, title = "", ""
         except TimeoutError:
             raise WebError("fetch_failed: timeout")
         except WebError:
             raise
-        except (httpx.HTTPError, httpx.InvalidURL, OSError, ValueError, UnicodeError) as e:
-            raise WebError(f"fetch_failed: {type(e).__name__}")
+        except Exception as e:  # never leak a raw exception type to callers
+            raise WebError(f"fetch_failed: {re.sub(r'[^A-Za-z0-9_]', '', type(e).__name__)}")
     finally:
         if own:
             await client.aclose()
-
-    decoded = _decode(body, ctype).replace("\x00", "")
-    media = ctype.split(";", 1)[0].strip().lower()
-    if media == "text/plain":
-        text, title = decoded.strip(), ""
-    else:
-        try:
-            text, title = await asyncio.to_thread(_extract, decoded)
-        except Exception:
-            text, title = "", ""
     page = {"url": final_url, "title": title[:300], "text": text, "truncated": truncated}
     if len(text) > max_chars:
         page["text"], page["truncated"] = text[:max_chars], True
@@ -391,9 +478,9 @@ async def web_search(query: str, n: int = 5, backend: Callable | None = None) ->
             if not isinstance(link, str) or not link.lower().startswith(("http://", "https://")):
                 continue
             results.append({
-                "title": str(item.get("title") or "")[:300],
+                "title": _clean(str(item.get("title") or ""))[:300],
                 "url": link[:MAX_URL_LEN],
-                "snippet": str(item.get("body") or item.get("snippet") or "")[:600],
+                "snippet": _clean(str(item.get("body") or item.get("snippet") or ""))[:600],
             })
             if len(results) >= n:
                 break
@@ -404,11 +491,15 @@ async def web_search(query: str, n: int = 5, backend: Callable | None = None) ->
 
 # --------------------------------------------------------------------------- untrusted wrapper
 
-_TAG_OPEN = re.compile(r"<(?=\s*/?\s*untrusted_web_content)", re.I)
-
-
 def wrap_untrusted(text: str) -> str:
-    """Wrap web text so the model treats it as data. Neutralises any opening/closing tag inside it."""
-    text = _ZERO_WIDTH.sub("", str(text))
-    text = _TAG_OPEN.sub("&lt;", text)
+    """Wrap web text so the model treats it as data.
+
+    NFKC-normalise (folds full-width look-alikes), strip all format chars (bidi/zero-width/soft-hyphen)
+    and Unicode tag characters U+E0000-E007F (hidden instructions), then escape EVERY '<' and '>' so no
+    tag (real or look-alike, open or close) can exist inside the body.
+    """
+    text = unicodedata.normalize("NFKC", str(text))
+    text = "".join(c for c in text
+                   if unicodedata.category(c) != "Cf" and not 0xE0000 <= ord(c) <= 0xE007F)
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
     return "<untrusted_web_content>\n" + text + "\n</untrusted_web_content>"
