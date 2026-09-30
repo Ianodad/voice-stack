@@ -2,51 +2,46 @@ import type { StoredMessage } from "./api";
 
 export type Part = { type: "text" | "code"; language?: string; text: string };
 
-const FENCE = "```";
+const OPEN_RE = /^([`~])\1{2,}/;
 
 /**
  * Split text into prose and fenced-code parts. Shared by live bot-output
- * events and stored history. An unterminated fence is still a code part.
+ * events and stored history. Same rules as voice_stack/fence.py: a fence opens
+ * with 3+ backticks or tildes at the start of a line (rest of the line is the
+ * language) and closes only on a run of the same character, at least as long,
+ * alone on its line. Fence marks elsewhere are plain text. An unterminated
+ * fence is still a code part. CRLF is normalised to LF.
  */
 export function parseFences(text: string): Part[] {
   const parts: Part[] = [];
-  const pushText = (t: string) => {
-    if (t.trim()) parts.push({ type: "text", text: t.trim() });
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  let prose: string[] = [];
+  const flushProse = () => {
+    const t = prose.join("\n").trim();
+    if (t) parts.push({ type: "text", text: t });
+    prose = [];
   };
-  let rest = text;
-  for (;;) {
-    const open = rest.indexOf(FENCE);
-    if (open < 0) {
-      pushText(rest);
-      return parts;
+  let i = 0;
+  while (i < lines.length) {
+    const m = OPEN_RE.exec(lines[i]);
+    if (!m) {
+      prose.push(lines[i++]);
+      continue;
     }
-    pushText(rest.slice(0, open));
-    rest = rest.slice(open + FENCE.length);
-    const nl = rest.indexOf("\n");
-    const inlineClose = rest.indexOf(FENCE);
-    let language = "";
-    let body: string;
-    if (nl < 0 || (inlineClose >= 0 && inlineClose < nl)) {
-      // "```code```" on one line (or an unterminated opener with no newline).
-      if (inlineClose >= 0) {
-        parts.push({ type: "code", language, text: rest.slice(0, inlineClose) });
-        rest = rest.slice(inlineClose + FENCE.length);
-        continue;
-      }
-      language = rest.trim();
-      parts.push({ type: "code", language, text: "" });
-      return parts;
-    }
-    language = rest.slice(0, nl).trim();
-    body = rest.slice(nl + 1);
-    const close = body.indexOf(FENCE);
-    if (close < 0) {
-      parts.push({ type: "code", language, text: body.replace(/\n$/, "") });
-      return parts;
-    }
-    parts.push({ type: "code", language, text: body.slice(0, close).replace(/\n$/, "") });
-    rest = body.slice(close + FENCE.length);
+    flushProse();
+    const fence = m[0];
+    const language = lines[i].slice(fence.length).trim();
+    const closeRe = new RegExp("^" + fence[0] + "{" + fence.length + ",}[ \\t]*$");
+    const body: string[] = [];
+    i++;
+    while (i < lines.length && !closeRe.test(lines[i])) body.push(lines[i++]);
+    const closed = i < lines.length;
+    i++; // skip the closing fence (or run past the end when unterminated)
+    if (!closed && body.length && body[body.length - 1] === "") body.pop();
+    parts.push({ type: "code", language, text: body.join("\n") });
   }
+  flushProse();
+  return parts;
 }
 
 function copyText(text: string): Promise<void> {
@@ -57,6 +52,7 @@ function copyText(text: string): Promise<void> {
 }
 
 function legacyCopy(text: string): Promise<void> {
+  const prev = document.activeElement as HTMLElement | null;
   const ta = document.createElement("textarea");
   ta.value = text;
   ta.setAttribute("readonly", "");
@@ -71,6 +67,7 @@ function legacyCopy(text: string): Promise<void> {
     ok = false;
   }
   ta.remove();
+  prev?.focus?.(); // the temporary textarea stole focus
   return ok ? Promise.resolve() : Promise.reject(new Error("copy failed"));
 }
 
