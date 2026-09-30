@@ -314,4 +314,54 @@ with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outsid
         (root/name).unlink()
     # Known accepted limitation: Cf (ZWJ/ZWNJ) rejected in paths and edit text
     raises(T.plan_edit, root, "s1.txt", "hello", "a\u200db")
+    # ---- follow-up: injective display (backslash, tab, marks, default-ignorables) ----
+    import re as _re
+    def decode_display(x):
+        out, i = [], 0
+        while i < len(x):
+            c = x[i]
+            if c != "\\":
+                out.append(c); i += 1; continue
+            n = x[i + 1]
+            if n == "\\": out.append("\\"); i += 2
+            elif n == "t": out.append("\t"); i += 2
+            elif n == "u": out.append(chr(int(x[i+2:i+6], 16))); i += 6
+            elif n == "U": out.append(chr(int(x[i+2:i+10], 16))); i += 10
+            else: raise AssertionError(f"bad escape in {x!r}")
+        return "".join(out)
+    corpus = ["C:\\new", "\\u202e", "\u202e", "\\\u202e", "\\\\", "\\t", "\t", "a\tb", "\\U000f0000", "\U000f0000",
+              "\U000e0041tag", "\U000e0100", "\ufe0f", "a\u034fb", "e" + "\u0301" * 200, "\u0301" * 5, "x\u0301\u0302y",
+              "a\r\nb", "a\r", "   ", "  a   b  ", "\u00a0", "\u3164", "plain text", "", "\\u0041", "A", "\u2800\\",
+              "\U0001f600 emoji", "caf\u00e9", "/\u0301x", " \u0301x"]
+    disp = {}
+    for x in corpus:
+        d = T._display(x)
+        assert decode_display(d) == x.replace("\r", "\r"), (x, d)   # decodes back to the original text
+        assert d not in disp, (x, disp.get(d)); disp[d] = x               # injective on the corpus
+        assert "\t" not in d and "\u202e" not in d and "\U000f0000" not in d
+    assert T._display("C:\\new") == "C:\\\\new" and T._display("\\u202e") == "\\\\u202e" and T._display("\u202e") == "\\u202e"
+    assert T._display("a\tb") == "a\\tb" and T._display("a\\tb") == "a\\\\tb"
+    assert T._display("\U000f0000") == "\\U000f0000" and T._display("\U000e0041") == "\\U000e0041"
+    assert T._display("  a   b") == "  a   b"                                 # space runs stay literal
+    z = T._display("e" + "\u0301" * 200)
+    assert z.count("\u0301") == 2 and z.count("\\u0301") == 198, z[:40]     # first 2 kept, rest escaped
+    assert T._display("a\r", crlf=True) == "a" and T._display("a\r") == "a\\u000d"
+    # randomized injectivity over a nasty alphabet
+    import random, itertools
+    rnd = random.Random(7)
+    alpha = ["a", " ", "\\", "t", "u", "0", "\t", "\u202e", "\u0301", "\u00a0", "\U000f0000", "\ufe0f", "\r", "/", "2"]
+    seen = {}
+    for _ in range(20000):
+        x = "".join(rnd.choice(alpha) for _ in range(rnd.randint(0, 7)))
+        d = T._display(x)
+        assert decode_display(d) == x and seen.setdefault(d, x) == x, (x, d, seen[d])
+    # the card text flows through plan_edit / plan_move: backslashes and tabs visible, stored plan raw
+    (root/"bs.txt").write_text("path C:\\new\tvalue\n", encoding="utf-8")
+    pe = T.plan_edit(root, "bs.txt", "value", "\\u202e")
+    assert "C:\\\\new\\tvalue" in pe["diff"] and "+" in pe["diff"] and pe["new_text"] == "\\u202e"
+    assert "\\\\u202e" in pe["diff"] and "\t" not in pe["diff"]
+    (root/"we\\ird.txt").write_text("x")
+    pm = T.plan_move(root, "we\\ird.txt", "archive/a\\tb.txt")
+    assert pm["summary"] == "Move we\\\\ird.txt to archive/a\\\\tb.txt" and pm["dst"] == "archive/a\\tb.txt"
+    (root/"we\\ird.txt").unlink()
     print("check_tools.py: PASS")

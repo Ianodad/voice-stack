@@ -476,27 +476,53 @@ def _check_edit_text(old_text: str, new_text: str) -> None:
             raise ToolError("text is not valid unicode", code="bad_args")
 
 
-_BLANKISH = frozenset("\u3164\u115f\u1160\uffa0\u2800\u17b4\u17b5")
+_BLANKISH = frozenset("\u034f\u3164\u115f\u1160\uffa0\u2800\u17b4\u17b5")
+
+
+def _hidden_char(c: str) -> bool:
+    cp = ord(c)
+    return (c in _BLANKISH or 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF
+            or 0xE0000 <= cp <= 0xE007F)
+
+
+def _esc(c: str) -> str:
+    return f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}"
 
 
 def _display(line: str, *, crlf: bool = False) -> str:
-    """Render text for the confirmation card: every invisible, blank-looking or
-    control character becomes a visible \\uXXXX escape. A trailing \\r is hidden only
-    when the whole file uses consistent CRLF endings (crlf=True)."""
+    """Render text for the confirmation card. The mapping is injective.
+
+    Escape format (lowercase hex): a real backslash -> `\\\\`, a real TAB -> `\\t`,
+    any hidden/blank-looking/format/control/private-use/default-ignorable char ->
+    `\\uxxxx` (BMP) or `\\Uxxxxxxxx` (astral, 8 digits). Combining marks (Mn/Me) are
+    escaped at line start, after whitespace or "/", and beyond the first 2 in a run.
+    A trailing CR is hidden only when crlf=True (whole file uses consistent CRLF).
+    Plain spaces (including runs) and all other characters stay literal.
+    """
     if crlf and line.endswith("\r"):
         line = line[:-1]
     out = []
     prev = " "
+    run = 0
     for c in line:
         cat = unicodedata.category(c)
-        bad = (cat in ("Cc", "Cf", "Zl", "Zp", "Cs", "Co") or (cat == "Zs" and c != " ")
-               or c in _BLANKISH or (cat == "Mn" and (prev.isspace() or prev == "/")))
-        if bad and c != "\t":
-            out.append(f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
+        mark = cat in ("Mn", "Me")
+        run = run + 1 if mark else 0
+        if c == "\\":
+            out.append("\\\\")
+        elif c == "\t":
+            out.append("\\t")
+        elif (cat in ("Cc", "Cf", "Zl", "Zp", "Cs", "Co") or (cat == "Zs" and c != " ")
+              or _hidden_char(c)
+              or (mark and (prev.isspace() or prev == "/" or run > 2))):
+            out.append(_esc(c))
         else:
             out.append(c)
         prev = c
     return "".join(out)
+
+
+display_text = _display
 
 
 def _is_crlf(text: str) -> bool:
