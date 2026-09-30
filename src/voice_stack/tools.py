@@ -342,8 +342,11 @@ def find_file(root: Path, name: str) -> list[str]:
 
 
 def read_file(root: Path, path: str, limit: int = 65536) -> dict:
-    if isinstance(limit, str) and limit.strip().isdigit():
-        limit = int(limit)
+    if isinstance(limit, str):
+        try:
+            limit = int(limit.strip())
+        except ValueError:
+            raise ToolError("limit must be a whole number", code="bad_args")
     if isinstance(limit, bool) or not isinstance(limit, int):
         raise ToolError("limit must be a whole number", code="bad_args")
     limit = max(0, min(limit, 65536))
@@ -396,7 +399,7 @@ def _check_move(root: Path, src: str, dst: str, *, exact: bool) -> tuple[Path, P
 def plan_move(root: Path, src: str, dst: str) -> dict:
     real_src, real_dst = _check_move(root, src, dst, exact=False)
     s, d = rel(root, real_src), rel(root, real_dst)
-    return {"kind": "move", "src": s, "dst": d, "summary": f"Move {s} to {d}"}
+    return {"kind": "move", "src": s, "dst": d, "summary": f"Move {_display(s)} to {_display(d)}"}
 
 
 def apply_move(root: Path, plan: dict) -> dict:
@@ -473,15 +476,36 @@ def _check_edit_text(old_text: str, new_text: str) -> None:
             raise ToolError("text is not valid unicode", code="bad_args")
 
 
-def _display(line: str) -> str:
-    """Make invisible/control characters in diff context lines visible."""
-    return "".join(
-        f"\\u{ord(c):04x}" if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp", "Cs") and c != "\t" else c
-        for c in line.rstrip("\r"))
+_BLANKISH = frozenset("\u3164\u115f\u1160\uffa0\u2800\u17b4\u17b5")
 
 
-def _lines(text: str) -> list[str]:
-    return [_display(x) for x in text.split("\n")]
+def _display(line: str, *, crlf: bool = False) -> str:
+    """Render text for the confirmation card: every invisible, blank-looking or
+    control character becomes a visible \\uXXXX escape. A trailing \\r is hidden only
+    when the whole file uses consistent CRLF endings (crlf=True)."""
+    if crlf and line.endswith("\r"):
+        line = line[:-1]
+    out = []
+    prev = " "
+    for c in line:
+        cat = unicodedata.category(c)
+        bad = (cat in ("Cc", "Cf", "Zl", "Zp", "Cs", "Co") or (cat == "Zs" and c != " ")
+               or c in _BLANKISH or (cat == "Mn" and (prev.isspace() or prev == "/")))
+        if bad and c != "\t":
+            out.append(f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
+        else:
+            out.append(c)
+        prev = c
+    return "".join(out)
+
+
+def _is_crlf(text: str) -> bool:
+    n = text.count("\r\n")
+    return n > 0 and text.count("\r") == n and text.count("\n") == n
+
+
+def _lines(text: str, crlf: bool) -> list[str]:
+    return [_display(x, crlf=crlf) for x in text.split("\n")]
 
 
 def plan_edit(root: Path, path: str, old_text: str, new_text: str) -> dict:
@@ -499,10 +523,14 @@ def plan_edit(root: Path, path: str, old_text: str, new_text: str) -> dict:
         raise ToolError("too_large")
     if not os.stat(real).st_mode & stat.S_IWUSR:
         raise ToolError("that file is read-only", code="read_only")
-    diff = "\n".join(difflib.unified_diff(_lines(text), _lines(new),
-                                          fromfile=r, tofile=r, lineterm=""))
+    crlf = _is_crlf(text) and _is_crlf(new)
+    shown = _display(r)
+    diff = "\n".join(difflib.unified_diff(_lines(text, crlf), _lines(new, crlf),
+                                          fromfile=shown, tofile=shown, lineterm=""))
+    if old_text != new_text and diff == "":
+        raise ToolError("change not representable")
     return {"kind": "edit", "path": r, "old_text": old_text, "new_text": new_text,
-            "summary": f"Edit {r}", "diff": diff, "sha256": hashlib.sha256(data).hexdigest()}
+            "summary": f"Edit {shown}", "diff": diff, "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def _backup_dir(root: Path) -> Path:

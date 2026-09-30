@@ -267,4 +267,51 @@ with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outsid
         raises(T.plan_edit, root, bad, "a", "b"); raises(T.plan_edit, root, "s1.txt", bad, "b")
         raises(T.plan_edit, root, "s1.txt", "hello", bad)
         assert T.find_file(root, bad) == []
+    # ---- fix round 2 ----
+    # N1 limit strings that isdigit() but are not ints
+    for badlim in ["²", "³", "①", "", "  ", "1e3", "0x10", "9" * 5000]:
+        raises(T.read_file, root, "big.txt", limit=badlim)
+    assert T.read_file(root, "big.txt", limit=" 7 ")["content"] == "a" * 7
+    # N2 the diff shows exactly what is written: a change in \r is never invisible
+    def written(path, old, new):
+        pe = T.plan_edit(root, path, old, new); T.apply_edit(root, pe); return pe
+    for content, old, new in [("x\ny\n", "x\n", "x\r\n"), ("x\ny\n", "x", "x\r"), ("x\r\ny\n", "x\r\n", "x\n"),
+                              ("x\r\ny\r\n", "y", "y\r"), ("x\r\ny\r\n", "x\r\ny", "x\ny"), ("a\nb", "b", "b\n"),
+                              ("a\nb\n", "b\n", "b")]:
+        (root/"crlf.txt").write_bytes(content.encode())
+        pe = T.plan_edit(root, "crlf.txt", old, new)
+        assert pe["diff"] != "", (content, old, new)
+        body = [l for l in pe["diff"].split("\n") if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+        assert body and (any("\\u000d" in l for l in body) or "\n" in old + new), (content, old, new, pe["diff"])
+        T.apply_edit(root, pe)
+        assert (root/"crlf.txt").read_bytes() == content.replace(old, new, 1).encode()
+    # consistent CRLF file + consistent CRLF edit: the \r is hidden (clean diff)
+    (root/"crlf.txt").write_bytes(b"one\r\ntwo\r\n")
+    pe = T.plan_edit(root, "crlf.txt", "two", "2"); assert "\\u000d" not in pe["diff"] and "-two" in pe["diff"].split("\n")
+    # N3 blank-looking characters are escaped in diff lines and summaries, but still editable text
+    sneaky = {"\u00a0": "\\u00a0", "\u3164": "\\u3164", "\u115f": "\\u115f", "\u2800": "\\u2800",
+              "\ue000": "\\ue000", "\u2003": "\\u2003", "\U000f0000": "\\U000f0000"}
+    for ch, esc in sneaky.items():
+        (root/"sn.txt").write_text(f"keep\n{ch}old\n", encoding="utf-8")
+        pe = T.plan_edit(root, "sn.txt", "old", f"new{ch}x")
+        assert ch not in pe["diff"] and esc in pe["diff"], (esc, pe["diff"])
+        T.apply_edit(root, pe); assert ch in (root/"sn.txt").read_text(encoding="utf-8")
+    (root/"sn.txt").write_text("a\n\u0301combining\nx\u0301y\n", encoding="utf-8")   # Mn at line start vs inside a word
+    pe = T.plan_edit(root, "sn.txt", "combining", "C")
+    assert "\\u0301combining" in pe["diff"] and "\u0301" not in pe["diff"].replace("x\u0301y", "")
+    (root/"sn.txt").write_text("keep\nx\u0301y\nold\n", encoding="utf-8")
+    assert "x\u0301y" in T.plan_edit(root, "sn.txt", "old", "new")["diff"]   # mid-word mark is left alone
+    for ch, esc in [("\u00a0", "\\u00a0"), ("\u3164", "\\u3164"), ("\u2800", "\\u2800"), ("\ue000", "\\ue000"), ("\u0301", "\\u0301")]:
+        name = f"{ch}z.txt"
+        (root/name).write_text("q", encoding="utf-8")
+        pm = T.plan_move(root, name, f"archive/{ch}zz.txt")
+        assert ch not in pm["summary"] and esc in pm["summary"], pm["summary"]
+        assert pm["src"] == name and pm["dst"] == f"archive/{ch}zz.txt"      # raw paths kept for apply
+        (root/name).unlink()
+        (root/name).write_text("q2\n", encoding="utf-8")
+        pe = T.plan_edit(root, name, "q2", "r")
+        assert ch not in pe["summary"] and esc in pe["summary"] and ch not in pe["diff"], pe["summary"]
+        (root/name).unlink()
+    # Known accepted limitation: Cf (ZWJ/ZWNJ) rejected in paths and edit text
+    raises(T.plan_edit, root, "s1.txt", "hello", "a\u200db")
     print("check_tools.py: PASS")
