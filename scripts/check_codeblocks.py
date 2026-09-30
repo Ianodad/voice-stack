@@ -269,6 +269,51 @@ async def main():
         got = [a async for a in agg.aggregate("Fresh prose here. More.")]
         assert [a.text for a in got] == ["Fresh prose here."], got
     print("interrupt state reset ok")
+
+    # 13. round 2: inline openers, closers with trailing text, nested fences, flush
+    def sizes(text):
+        return [[text], [text[i : i + 4] for i in range(0, len(text), 4)], list(text)]
+
+    def spoken_text(got):
+        return " ".join(only(got, "sentence"))
+
+    for chunks in sizes("Sure. Here: ```bash\nls\n``` done."):
+        got = await agg_run(chunks)
+        assert only(got, "code") == ["```bash\nls\n```"], got
+        assert spoken_text(got) == "Sure. Here: done.", got
+        assert_no_code_spoken(got, "ls", "```")
+    for chunks in sizes("Sure. Here: ```bash\nls\n```\nDone."):
+        got = await agg_run(chunks)
+        assert only(got, "code") == ["```bash\nls\n```"] and spoken_text(got) == "Sure. Here: Done.", got
+    for chunks in sizes("Here: ~~~py\nx=1\n~~~ done."):
+        got = await agg_run(chunks)
+        assert only(got, "code") == ["~~~py\nx=1\n~~~"] and spoken_text(got) == "Here: done.", got
+    for text in (
+        "Use ```bash to run it. Fine.",
+        "Note: ``` mid-line\nnext line. Fine.",
+        "A string ``` here and ~~~ there. Fine.",
+        "Here: ```" + "a" * 25 + "\nnext. Fine.",
+        "Inline ```x``` mention.\nAnd more. Fine.",
+    ):
+        for chunks in sizes(text):
+            got = await agg_run(chunks)
+            assert only(got, "code") == [], (text, got)
+            assert spoken_text(got).split() == text.split(), (text, got)
+    for chunks in sizes("Go.\n```bash\ncat <<EOF\n```bash\nEOF\n```\nDone."):
+        got = await agg_run(chunks)
+        assert only(got, "code") == ["```bash\ncat <<EOF\n```bash\nEOF\n```"], got
+        assert spoken_text(got) == "Go. Done.", got
+    for chunks in sizes("Sure thing, I did it.\n\n```"):
+        got = await agg_run(chunks)
+        assert spoken_text(got).strip() == "Sure thing, I did it." and only(got, "code") == [], got
+    got = await agg_run(["Only a fence.\n```"][0:0] + ["```"])
+    assert only(got, "code") == ["```"], got  # bare fence, no prose pending: empty code item as before
+    spoken, outputs, ctx, turns = await run(["Sure. Here: ```bash\nls\n``` done."])
+    assert codes(outputs) == ["```bash\nls\n```"], outputs
+    assert not any("ls" in x.split() or "```" in x for x in spoken), spoken
+    assert " ".join(spoken).replace(CODE_CUE, "").split() == "Sure. Here: done.".split(), spoken
+    assert turns == [("assistant", "Sure. Here: ```bash\nls\n``` done.")], turns
+    print("round 2 ok")
     print("PASS")
 
 

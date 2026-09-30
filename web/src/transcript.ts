@@ -2,7 +2,22 @@ import type { StoredMessage } from "./api";
 
 export type Part = { type: "text" | "code"; language?: string; text: string };
 
-const OPEN_RE = /^([`~])\1{2,}/;
+const OPEN_BOL = /^([`~])\1{2,}/;
+const RUN_RE = /([`~])\1{2,}/g;
+const INFO_RE = /^[A-Za-z0-9+#\-_./]{0,20}$/;
+
+/** An opening fence on this line: at line start (rest = info) or mid-line
+ *  when the run is followed only by a short info string up to end of line. */
+function findOpen(line: string): { before: string; fence: string; info: string } | null {
+  const m = OPEN_BOL.exec(line);
+  if (m) return { before: "", fence: m[0], info: line.slice(m[0].length).trim() };
+  RUN_RE.lastIndex = 0;
+  for (let r = RUN_RE.exec(line); r; r = RUN_RE.exec(line)) {
+    const rest = line.slice(r.index + r[0].length);
+    if (INFO_RE.test(rest)) return { before: line.slice(0, r.index), fence: r[0], info: rest };
+  }
+  return null;
+}
 
 /**
  * Split text into prose and fenced-code parts. Shared by live bot-output
@@ -23,20 +38,25 @@ export function parseFences(text: string): Part[] {
   };
   let i = 0;
   while (i < lines.length) {
-    const m = OPEN_RE.exec(lines[i]);
-    if (!m) {
+    const o = findOpen(lines[i]);
+    if (!o) {
       prose.push(lines[i++]);
       continue;
     }
+    if (o.before) prose.push(o.before);
     flushProse();
-    const fence = m[0];
-    const language = lines[i].slice(fence.length).trim();
-    const closeRe = new RegExp("^" + fence[0] + "{" + fence.length + ",}[ \\t]*$");
+    const { fence, info: language } = o;
+    // closer: same char, >= length, then end of line or blanks + more text
+    const closeRe = new RegExp("^" + fence[0] + "{" + fence.length + ",}(?:[ \\t]*$|[ \\t]+\\S)");
     const body: string[] = [];
     i++;
     while (i < lines.length && !closeRe.test(lines[i])) body.push(lines[i++]);
     const closed = i < lines.length;
-    i++; // skip the closing fence (or run past the end when unterminated)
+    if (closed) {
+      const after = lines[i].replace(new RegExp("^" + fence[0] + "+"), "").trim();
+      if (after) lines[i] = after; // text after the closer is prose
+      else i++;
+    } else i++;
     if (!closed && body.length && body[body.length - 1] === "") body.pop();
     parts.push({ type: "code", language, text: body.join("\n") });
   }
