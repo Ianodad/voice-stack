@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -11,7 +13,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
-from pipecat.frames.frames import InterruptionFrame
+from pipecat.frames.frames import InterruptionFrame, TTSSpeakFrame
+from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.request_handler import (
     ConnectionMode,
@@ -23,16 +26,30 @@ from pipecat.transports.smallwebrtc.request_handler import (
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.workers.runner import WorkerRunner
 
+from voice_stack import tools
+from voice_stack.actions import ActionError, PendingActions
 from voice_stack.bot import build_worker
 from voice_stack.history import History
 from voice_stack.runtime import Runtime
+from voice_stack.toolset import ToolSession
 
 CANCEL_TIMEOUT = 10.0
+PUSH_TIMEOUT = 2.0
+SUMMARY_SPOKEN_MAX = 80
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069]")
+
+
+def _clean(text: object, limit: int) -> str:
+    """Strip control/bidi characters and cap the length (text may contain file names)."""
+    return _CONTROL.sub("", str(text))[:limit].strip()
 
 
 class _Session:
-    def __init__(self, cid: str, connection, worker, runner: WorkerRunner):
+    def __init__(self, cid: str, connection, worker, runner: WorkerRunner,
+                 tool_session: ToolSession | None = None):
         self.cid = cid
+        self.tool_session = tool_session
         self.connection = connection
         self.worker = worker
         self.runner = runner
@@ -42,9 +59,12 @@ class _Session:
 class SessionManager:
     """Owns the single live voice session. A new session replaces the old one."""
 
-    def __init__(self, runtime: Runtime, history: History):
+    def __init__(self, runtime: Runtime, history: History,
+                 pending: PendingActions | None = None, root: Path | None = None):
         self._runtime = runtime
         self._history = history
+        self._pending = pending
+        self._root = Path(root) if root is not None else tools.DEFAULT_ROOT
         self._lock = asyncio.Lock()
         self._current: _Session | None = None
         self._all_tasks: list[asyncio.Task] = []
@@ -53,6 +73,21 @@ class SessionManager:
     def live_workers(self) -> int:
         """Number of session tasks (ever started) that have not finished."""
         return sum(1 for t in self._all_tasks if not t.done())
+
+    def current_session_id(self) -> str | None:
+        """Tool-session id of the live session, or None when there is none."""
+        s = self._current
+        if s is None or s.tool_session is None or s.task is None or s.task.done():
+            return None
+        return s.tool_session.session_id
+
+    def live_session(self, session_id: str) -> _Session | None:
+        """The live session if (and only if) it still has this tool-session id."""
+        s = self._current
+        if s is not None and s.tool_session is not None and s.tool_session.session_id == session_id \
+                and s.task is not None and not s.task.done():
+            return s
+        return None
 
     async def start(self, connection, conversation_id: str | None) -> str:
         async with self._lock:
@@ -72,6 +107,10 @@ class SessionManager:
 
     async def _start_locked(self, connection, cid: str) -> str:
         history = self._history
+        tool_session = (
+            ToolSession(uuid.uuid4().hex, self._root, self._pending)
+            if self._pending is not None else None
+        )
         transport = SmallWebRTCTransport(
             connection,
             TransportParams(audio_in_enabled=True, audio_out_enabled=True),
@@ -82,9 +121,10 @@ class SessionManager:
             history.context_window(cid),
             mute_while_bot_speaks=False,
             on_turn=lambda role, content: history.append(cid, role, content),
+            tools=tool_session,
         )
         runner = WorkerRunner(handle_sigint=False, handle_sigterm=False)
-        session = _Session(cid, connection, worker, runner)
+        session = _Session(cid, connection, worker, runner, tool_session)
 
         @worker.rtvi.event_handler("on_client_message")
         async def _on_client_message(rtvi, msg):
@@ -110,6 +150,7 @@ class SessionManager:
             finally:
                 if self._current is session:
                     self._current = None
+                await self._discard(session)
                 # Session over: drop conversations nobody spoke in, but never
                 # the one belonging to a different, currently live session.
                 live = self._current
@@ -130,10 +171,37 @@ class SessionManager:
             await self._cancel_session(session, reason)
         self._current = None
 
+    async def _discard(self, session: _Session) -> int:
+        """Drop this session's pending actions (off the event loop). Never raises."""
+        ts = session.tool_session
+        if ts is None or self._pending is None:
+            return 0
+        try:
+            return await asyncio.to_thread(self._pending.discard_session, ts.session_id)
+        except Exception:
+            logger.exception("discard_session failed")
+            return 0
+
+    async def push(self, session: _Session, data: dict, speak: str | None = None) -> None:
+        """Best-effort RTVI message (and optional spoken line) to a live session's worker."""
+        try:
+            async def _go() -> None:
+                await session.worker.queue_frame(RTVIServerMessageFrame(data=data))
+                if speak:
+                    await session.worker.queue_frame(TTSSpeakFrame(speak, append_to_context=True))
+            await asyncio.wait_for(_go(), PUSH_TIMEOUT)
+        except Exception:
+            logger.warning("push {} to worker failed", data.get("type"))
+
     async def _cancel_session(self, session: _Session, reason: str) -> None:
+        # Pending actions die with the session, even if the worker already ended.
+        await self._discard(session)
+        if session.tool_session is not None:
+            session.tool_session.card_shown = False
         task = session.task
         if task is None or task.done():
             return
+        await self.push(session, {"type": "actions_cleared"})
         try:
             await session.worker.cancel(reason=reason)
         except Exception:
@@ -145,12 +213,16 @@ class SessionManager:
             await asyncio.wait({task}, timeout=CANCEL_TIMEOUT)
 
 
-def create_app(runtime: Runtime, history: History, static_dir: Path | None) -> FastAPI:
+def create_app(runtime: Runtime, history: History, static_dir: Path | None,
+               root: Path | None = None) -> FastAPI:
+    root = Path(root) if root is not None else tools.DEFAULT_ROOT
     handler = SmallWebRTCRequestHandler(connection_mode=ConnectionMode.SINGLE)
-    sessions = SessionManager(runtime, history)
+    pending = PendingActions(root)
+    sessions = SessionManager(runtime, history, pending, root)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        root.mkdir(parents=True, exist_ok=True)
         try:
             yield
         finally:
@@ -186,6 +258,75 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None) -> F
     offer_lock = asyncio.Lock()
     app.state.sessions = sessions
     app.state.handler = handler
+    app.state.pending = pending
+
+    # ---- assistant actions -------------------------------------------------
+    # With no live session: GET pending -> [] ; approve/deny -> 409 "no active session".
+    _MESSAGES = {400: "bad request", 404: "no such pending action",
+                 409: "that request expired or was already used", 429: "busy"}
+
+    def _http_error(e: ActionError) -> HTTPException:
+        if e.status == 422:
+            return HTTPException(status_code=422, detail=_clean(e, 300) or "could not complete the action")
+        if e.status in _MESSAGES:
+            return HTTPException(status_code=e.status, detail=_MESSAGES[e.status])
+        return HTTPException(status_code=500, detail="internal error")
+
+    @app.get("/api/actions/pending")
+    async def pending_actions():
+        sid = sessions.current_session_id()
+        if sid is None:
+            return []
+        return await asyncio.to_thread(pending.list, sid)
+
+    @app.post("/api/actions/{action_id}/approve")
+    async def approve_action(action_id: str):
+        sid = sessions.current_session_id()     # captured at request time
+        if sid is None:
+            raise HTTPException(status_code=409, detail="no active session")
+        try:
+            result = await asyncio.to_thread(pending.approve, action_id, sid)
+        except ActionError as e:
+            live = sessions.live_session(sid)
+            if live is not None and e.status == 409 and "already used" not in str(e):
+                live.tool_session.card_shown = False
+                await sessions.push(live, {"type": "action_result", "id": action_id, "status": "expired"})
+                await sessions.push(live, {"type": "actions_cleared"})
+            raise _http_error(e)
+        summary = _clean(result.get("summary", ""), 200)
+        live = sessions.live_session(sid)
+        if live is not None:
+            live.tool_session.card_shown = False
+            spoken = _clean(summary, SUMMARY_SPOKEN_MAX)
+            await sessions.push(
+                live,
+                {"type": "action_result", "id": action_id, "status": "done", "summary": summary},
+                speak=f"Done. {spoken}" if spoken else "Done.",
+            )
+        return {"status": "done", "id": action_id, "summary": summary}
+
+    @app.post("/api/actions/{action_id}/deny")
+    async def deny_action(action_id: str):
+        sid = sessions.current_session_id()
+        if sid is None:
+            raise HTTPException(status_code=409, detail="no active session")
+        try:
+            await asyncio.to_thread(pending.deny, action_id, sid)
+        except ActionError as e:
+            live = sessions.live_session(sid)
+            if live is not None and e.status == 409 and "already used" not in str(e):
+                live.tool_session.card_shown = False
+                await sessions.push(live, {"type": "action_result", "id": action_id, "status": "expired"})
+                await sessions.push(live, {"type": "actions_cleared"})
+            raise _http_error(e)
+        live = sessions.live_session(sid)
+        if live is not None:
+            live.tool_session.card_shown = False
+            await sessions.push(
+                live, {"type": "action_result", "id": action_id, "status": "denied"},
+                speak="Okay, I won't.",
+            )
+        return {"status": "denied", "id": action_id}
 
     @app.post("/api/offer")
     async def offer(request: Request, conversation_id: str | None = None):

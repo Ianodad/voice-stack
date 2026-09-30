@@ -43,6 +43,7 @@ class ToolSession:
     hops: int = 0
     filler_said: bool = False
     seen_urls: set = field(default_factory=set)   # normalized URLs from web_search results this session
+    card_shown: bool = False   # a pending_action card was pushed and not yet resolved (set by toolset/server)
 
     def reset_turn(self) -> None:
         self.hops = 0
@@ -259,12 +260,18 @@ def build(session: ToolSession) -> tuple[ToolsSchema, dict[str, Callable]]:
         action never exists without its card having been pushed."""
         async def inner() -> dict:
             p = await asyncio.to_thread(session.pending.propose, session.session_id, kind, pa)
+            if session.card_shown:
+                # propose succeeded although a card was shown: the old one expired and was swept
+                # silently. Clear it in the UI before the new card so nothing dead-ends.
+                await _push(params, {"type": "actions_cleared"})
+                session.card_shown = False
             if not await _push(params, {"type": "pending_action", "action": p.public()}):
                 try:
                     session.pending.deny(p.id, session.session_id)
                 except Exception:
                     log.exception("could not discard unshown pending action")
                 return dict(_NOT_SHOWN)
+            session.card_shown = True
             return {"status": "awaiting_user_confirmation", "summary": p.summary,
                     "instruction": "NOT DONE YET. Tell the user a confirmation card is on screen and the change "
                                    "happens only after they click Approve. Do not say it is done, updated, or moved."}
