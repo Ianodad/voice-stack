@@ -568,7 +568,7 @@ function clearActivity(): void {
 }
 
 function setActivity(name: string): void {
-  activityEl.textContent = ACTIVITY_LABELS[name] ?? "Working\u2026";
+  activityEl.textContent = Object.hasOwn(ACTIVITY_LABELS, name) ? ACTIVITY_LABELS[name] : "Working\u2026";
   window.clearTimeout(activityTimer);
   activityTimer = window.setTimeout(clearActivity, ACTIVITY_TIMEOUT_MS);
 }
@@ -590,9 +590,14 @@ function asAction(v: unknown): PublicAction | null {
 }
 
 let resyncing = false;
+let resyncQueued = false;
 /** A card can exist server-side without the UI knowing: ask, and show the first one. */
 async function resyncActions(gen: number): Promise<void> {
-  if (resyncing || gen !== generation || conn !== "live" || card.isOpen) return;
+  if (gen !== generation || conn !== "live" || card.isOpen) return;
+  if (resyncing) {
+    resyncQueued = true; // re-check once the in-flight request finishes
+    return;
+  }
   resyncing = true;
   try {
     const list = await pendingActions();
@@ -605,6 +610,10 @@ async function resyncActions(gen: number): Promise<void> {
     console.warn("could not fetch pending actions", e);
   } finally {
     resyncing = false;
+    if (resyncQueued) {
+      resyncQueued = false;
+      void resyncActions(generation);
+    }
   }
 }
 
@@ -651,10 +660,11 @@ function handleServerMessage(gen: number, data: unknown): void {
         const text = resultFor(status, card.currentKind, m.summary);
         card.finish(true);
         card.showResult(text);
-      } else {
+      } else if (!card.isClosed(m.id)) {
+        // Unknown id we never showed (e.g. decided from another tab): say so once.
         card.markClosed(m.id);
         card.showResult(resultFor(status, null, m.summary));
-      }
+      } // else: already handled locally; do not announce twice
       return;
     }
     case "actions_cleared":
@@ -665,8 +675,12 @@ function handleServerMessage(gen: number, data: unknown): void {
 
 card.onDecision(async (id, decision) => {
   try {
-    await (decision === "approve" ? approveAction(id) : denyAction(id));
-    if (card.currentId === id) {
+    const body = await (decision === "approve" ? approveAction(id) : denyAction(id));
+    const want = decision === "approve" ? "done" : "denied";
+    if (card.currentId === id && (body.id !== id || body.status !== want)) {
+      card.finish(true);
+      card.showResult("Unexpected reply from the server \u2014 check whether the change was made.");
+    } else if (card.currentId === id) {
       const kind = card.currentKind;
       card.finish(true);
       card.showResult(decision === "deny" ? RESULT_TEXT.denied : kind === "edit" ? RESULT_TEXT.edited : RESULT_TEXT.moved);
@@ -688,6 +702,14 @@ card.onDecision(async (id, decision) => {
   void resyncActions(generation);
 });
 card.onExpired(() => void resyncActions(generation));
+
+// Keep the fixed confirmation panel exactly above the control bar.
+const controlsEl = document.querySelector<HTMLElement>(".controls");
+if (controlsEl) {
+  const sync = () => document.documentElement.style.setProperty("--controls-h", `${controlsEl.offsetHeight}px`);
+  sync();
+  new ResizeObserver(sync).observe(controlsEl);
+}
 
 // ---------- controls ----------
 
@@ -730,6 +752,7 @@ window.addEventListener("keydown", (e) => {
   if (inTextField(e.target)) return;
   if (card.handleKey(e)) return; // Enter/Esc while a confirmation is open (Esc never interrupts)
   if (e.key === "Escape") {
+    if (e.repeat) return; // a held Esc must not send interrupt after interrupt
     if (conn === "live") {
       try {
         client?.sendClientMessage("interrupt");
@@ -739,7 +762,7 @@ window.addEventListener("keydown", (e) => {
     }
     return;
   }
-  if (e.code === "Space" && conn === "live" && muted) {
+  if (e.code === "Space" && conn === "live" && muted && !card.contains(e.target)) {
     e.preventDefault(); // also stops a focused button from "clicking"
     if (e.repeat || pttHeld) return;
     pttHeld = true;

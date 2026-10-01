@@ -50,7 +50,9 @@ export class ApiError extends Error {
   }
 }
 
-async function actionPost(id: string, verb: "approve" | "deny"): Promise<void> {
+export type ActionReply = { status?: unknown; id?: unknown };
+
+async function actionPost(id: string, verb: "approve" | "deny"): Promise<ActionReply> {
   const res = await fetch(`/api/actions/${encodeURIComponent(id)}/${verb}`, {
     method: "POST",
     headers: JSON_HEADERS,
@@ -65,6 +67,12 @@ async function actionPost(id: string, verb: "approve" | "deny"): Promise<void> {
       /* not json */
     }
     throw new ApiError(res.status, detail);
+  }
+  try {
+    const b = await res.json();
+    return b && typeof b === "object" ? (b as ActionReply) : {};
+  } catch {
+    return {};
   }
 }
 

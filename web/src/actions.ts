@@ -2,7 +2,8 @@
 //
 // Security-critical: the card is the user's only defence against file changes
 // caused by prompt-injected text. Every server-provided string is rendered via
-// textContent after escapeInvisible(), never innerHTML.
+// textContent after parseServerText(), never innerHTML, and the card must never
+// display something other than what will happen.
 
 export type PublicAction = {
   id: string;
@@ -13,64 +14,183 @@ export type PublicAction = {
 };
 
 export type Decision = "approve" | "deny";
-export type Segment = { kind: "text" | "esc"; text: string };
+export type Segment = { kind: "text" | "esc"; text: string; spaces?: boolean };
 
 export const ARM_DELAY_MS = 500;
 export const RESULT_MS = 4000;
+/** Leading indentation up to this many spaces is shown literally; longer runs get a chip. */
+export const MAX_LEADING_SPACES = 16;
 
 // Characters that are invisible, reorder text, or look like a normal space.
+// (Marks are handled separately: they are only dangerous in runs / after spaces.)
 const SUSPICIOUS =
-  /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Zs}\p{Cs}\p{Co}\p{Cn}\p{Variation_Selector}ㅤᅟᅠﾠ⠀]/u;
+  /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Zs}\p{Cs}\p{Co}\p{Cn}\p{Variation_Selector}\p{Default_Ignorable_Code_Point}ㅤᅟᅠﾠ⠀]/u;
+const MARK = /[\p{Mn}\p{Me}]/u;
 
 function escapeOf(cp: number): string {
-  const hex = cp.toString(16).toUpperCase();
-  return cp > 0xffff ? `\\u{${hex}}` : `\\u${hex.padStart(4, "0")}`;
+  const hex = cp.toString(16);
+  return cp > 0xffff ? `\\U${hex.padStart(8, "0")}` : `\\u${hex.padStart(4, "0")}`;
 }
 
+type Token = { esc: boolean; s: string };
+
 /**
- * Split `s` into plain text and visible escape chips. Anything invisible or
- * confusable becomes `\uXXXX`; a real backslash becomes `\\` (as a chip) so a
- * typed-out `‮` can never be mistaken for a real escape.
- * Kept: \n, \t, and the ordinary space.
+ * Server display contract: a real backslash arrives as `\\`; hidden chars as
+ * `\uxxxx` / `\Uxxxxxxxx`; TAB as `\t`. Split into literal text and escape
+ * tokens. Malformed escapes (lone `\`, `\u12`) stay literal. Backslashes are
+ * NEVER re-escaped here.
  */
-export function escapeInvisible(s: string): Segment[] {
-  const out: Segment[] = [];
+function tokenize(s: string): Token[] {
+  const out: Token[] = [];
   let buf = "";
   const flush = () => {
-    if (buf) out.push({ kind: "text", text: buf });
+    if (buf) out.push({ esc: false, s: buf });
     buf = "";
   };
-  for (const ch of s) {
-    // for..of yields a lone surrogate as a single code unit.
-    const cp = ch.codePointAt(0)!;
-    if (ch === "\n" || ch === "\t" || ch === " ") {
-      buf += ch;
-    } else if (ch === "\\") {
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c !== "\\") {
+      buf += c;
+      i++;
+      continue;
+    }
+    const n = s[i + 1];
+    if (n === "\\") {
+      buf += "\\";
+      i += 2;
+    } else if (n === "t") {
       flush();
-      out.push({ kind: "esc", text: "\\\\" });
-    } else if (SUSPICIOUS.test(ch)) {
+      out.push({ esc: true, s: "\\t" });
+      i += 2;
+    } else if (n === "u" && /^[0-9a-fA-F]{4}$/.test(s.slice(i + 2, i + 6))) {
       flush();
-      out.push({ kind: "esc", text: escapeOf(cp) });
+      out.push({ esc: true, s: s.slice(i, i + 6) });
+      i += 6;
+    } else if (n === "U" && /^[0-9a-fA-F]{8}$/.test(s.slice(i + 2, i + 10)) && parseInt(s.slice(i + 2, i + 10), 16) <= 0x10ffff) {
+      flush();
+      out.push({ esc: true, s: s.slice(i, i + 10) });
+      i += 10;
     } else {
-      buf += ch;
+      buf += "\\";
+      i++;
     }
   }
   flush();
   return out;
 }
 
-/** Append `s` to `parent` as text nodes and `.esc` chips. textContent only. */
-export function appendEscaped(parent: HTMLElement, s: string): void {
-  for (const seg of escapeInvisible(s)) {
+/**
+ * Parse a server display string into text and escape-chip segments. Also
+ * escapes anything invisible the server missed (defence in depth), chips runs
+ * of 3+ spaces (so a payload cannot hide behind padding), and chips marks that
+ * are stacked (>2) or follow whitespace.
+ */
+export function parseServerText(s: string, maxLeadingSpaces = MAX_LEADING_SPACES): Segment[] {
+  const out: Segment[] = [];
+  let buf = "";
+  let prev = " ";
+  let run = 0;
+  let spaces = 0;
+  let seen = false; // any non-space content so far (leading-indent detection)
+  const flush = () => {
+    if (buf) out.push({ kind: "text", text: buf });
+    buf = "";
+  };
+  const flushSpaces = (atEnd: boolean) => {
+    if (!spaces) return;
+    const leadingOk = !seen && spaces <= maxLeadingSpaces && !atEnd;
+    if (spaces >= 3 && !leadingOk) {
+      flush();
+      out.push({ kind: "esc", text: `␠×${spaces}`, spaces: true });
+    } else {
+      buf += " ".repeat(spaces);
+    }
+    spaces = 0;
+    prev = " ";
+  };
+  for (const tok of tokenize(s)) {
+    if (tok.esc) {
+      flushSpaces(false);
+      flush();
+      out.push({ kind: "esc", text: tok.s });
+      seen = true;
+      prev = "x";
+      run = 0;
+      continue;
+    }
+    for (const ch of tok.s) {
+      if (ch === " ") {
+        spaces++;
+        run = 0;
+        continue;
+      }
+      flushSpaces(false);
+      const mark = MARK.test(ch);
+      run = mark ? run + 1 : 0;
+      const bad =
+        SUSPICIOUS.test(ch) || (mark && (/\s/u.test(prev) || prev === "/" || run > 2));
+      if (bad) {
+        flush();
+        out.push({ kind: "esc", text: escapeOf(ch.codePointAt(0)!) });
+      } else {
+        buf += ch;
+      }
+      seen = true;
+      prev = ch;
+    }
+  }
+  flushSpaces(true);
+  flush();
+  return out;
+}
+
+function appendSegments(parent: HTMLElement, segs: Segment[]): void {
+  for (const seg of segs) {
     if (seg.kind === "text") {
       parent.append(document.createTextNode(seg.text));
     } else {
       const chip = document.createElement("span");
-      chip.className = "esc";
+      chip.className = seg.spaces ? "esc spaces" : "esc";
       chip.textContent = seg.text;
       parent.append(chip);
     }
   }
+}
+
+/** Append a server display string to `parent`: text nodes and `.esc` chips only. */
+export function appendServerText(parent: HTMLElement, s: string, maxLeadingSpaces = MAX_LEADING_SPACES): void {
+  appendSegments(parent, parseServerText(s, maxLeadingSpaces));
+}
+
+/** "N changed lines in M hunks" from a unified diff. */
+export function diffStats(diff: string): { changed: number; hunks: number } {
+  let changed = 0;
+  let hunks = 0;
+  let inHunk = false;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("@@")) {
+      hunks++;
+      inHunk = true;
+    } else if (inHunk && (line[0] === "+" || line[0] === "-")) {
+      changed++;
+    }
+  }
+  return { changed, hunks };
+}
+
+export function diffHeading(diff: string): string {
+  const { changed, hunks } = diffStats(diff);
+  const l = changed === 1 ? "1 changed line" : `${changed} changed lines`;
+  const h = hunks === 1 ? "1 hunk" : `${hunks} hunks`;
+  return `${l} in ${h}`;
+}
+
+function expiryCaption(sec: number): string {
+  if (!Number.isFinite(sec) || sec <= 0) return "expires soon";
+  if (sec < 60) return "expires in less than a minute";
+  const m = Math.ceil(sec / 60);
+  return `expires in ${m} minute${m === 1 ? "" : "s"}`;
 }
 
 const RESULT_TEXT = {
@@ -90,15 +210,23 @@ export class ActionCard {
   private approveBtn: HTMLButtonElement | null = null;
   private denyBtn: HTMLButtonElement | null = null;
   private errorEl: HTMLElement | null = null;
+  private captionEl: HTMLElement | null = null;
+  private diffEl: HTMLElement | null = null;
+  private hintEl: HTMLElement | null = null;
   private current: PublicAction | null = null;
-  private shownAt = 0;
-  private armed = false;
+  private expiresText = "";
+  // Approve gating: all of these must hold.
+  private timeArmed = false;
+  private armStart = 0;
+  private scrollNeeded = false;
+  private scrolledEnd = true;
   private decided = false;
   private armTimer: number | undefined;
   private expiryTimer: number | undefined;
   private resultTimer: number | undefined;
   private cb: ((id: string, d: Decision) => void) | null = null;
   private onExpire: (() => void) | null = null;
+  private readonly env = () => this.reevaluate();
   /** Ids that reached a terminal state; a late resync must not resurrect them. */
   private readonly closed = new Set<string>();
 
@@ -111,7 +239,7 @@ export class ActionCard {
     this.cb = cb;
   }
 
-  /** Called when the local 5-minute timer runs out (card already cleared). */
+  /** Called when the local expiry timer runs out (card already cleared). */
   onExpired(cb: () => void): void {
     this.onExpire = cb;
   }
@@ -125,6 +253,9 @@ export class ActionCard {
   get currentKind(): PublicAction["kind"] | null {
     return this.current?.kind ?? null;
   }
+  isClosed(id: string): boolean {
+    return this.closed.has(id);
+  }
   contains(t: EventTarget | null): boolean {
     return !!this.card && t instanceof Node && this.card.contains(t);
   }
@@ -137,13 +268,15 @@ export class ActionCard {
     if (this.closed.has(a.id)) return false;
     this.current = a;
     this.decided = false;
-    this.armed = false;
-    this.shownAt = performance.now();
+    this.timeArmed = false;
+    this.armStart = 0;
+    this.scrollNeeded = false;
+    this.scrolledEnd = true;
+    this.expiresText = expiryCaption(a.expires_in);
 
     const card = document.createElement("div");
     card.className = "action-card";
     card.setAttribute("role", "alertdialog");
-    card.setAttribute("aria-live", "polite");
     card.tabIndex = -1;
 
     const title = document.createElement("h2");
@@ -152,28 +285,46 @@ export class ActionCard {
     card.setAttribute("aria-labelledby", title.id);
 
     const summary = document.createElement("p");
-    summary.className = "action-summary";
-    appendEscaped(summary, a.summary);
+    summary.className = "action-summary srv";
+    summary.id = "action-card-summary";
+    appendServerText(summary, a.summary);
+    card.setAttribute("aria-describedby", summary.id);
 
     card.append(title, summary);
 
     if (a.kind === "edit" && a.diff) {
+      const stats = document.createElement("p");
+      stats.className = "action-stats";
+      stats.textContent = diffHeading(a.diff);
       const pre = document.createElement("pre");
-      pre.className = "action-diff";
-      const lines = a.diff.split("\n");
-      lines.forEach((line, i) => {
+      pre.className = "action-diff srv";
+      pre.tabIndex = 0;
+      pre.setAttribute("role", "region");
+      pre.setAttribute("aria-label", "Changes");
+      for (const line of a.diff.split("\n")) {
         const span = document.createElement("span");
         const c = line.charAt(0);
         span.className = c === "+" ? "add" : c === "-" ? "del" : "ctx";
-        appendEscaped(span, line);
+        if (c === "+" || c === "-" || c === " ") {
+          // The marker is plain; the rest is server text (leading indent measured after it).
+          span.append(document.createTextNode(c));
+          appendServerText(span, line.slice(1));
+        } else {
+          appendServerText(span, line);
+        }
         pre.append(span);
-        if (i < lines.length - 1) pre.append(document.createTextNode("\n"));
-      });
-      card.append(pre);
+      }
+      pre.addEventListener("scroll", this.env, { passive: true });
+      this.hintEl = document.createElement("p");
+      this.hintEl.className = "action-hint";
+      this.hintEl.textContent = "Scroll to see the rest of the changes.";
+      this.hintEl.hidden = true;
+      this.diffEl = pre;
+      card.append(stats, pre, this.hintEl);
     }
 
     this.errorEl = document.createElement("p");
-    this.errorEl.className = "action-error";
+    this.errorEl.className = "action-error srv";
     this.errorEl.hidden = true;
 
     const row = document.createElement("div");
@@ -181,23 +332,28 @@ export class ActionCard {
     this.approveBtn = this.mkButton("Approve", "Enter", "approve");
     this.approveBtn.classList.add("approve");
     this.denyBtn = this.mkButton("Deny", "Esc", "deny");
-    const caption = document.createElement("span");
-    caption.className = "action-caption muted small-text";
-    caption.textContent = "expires in 5 minutes";
-    row.append(this.approveBtn, this.denyBtn, caption);
+    this.captionEl = document.createElement("span");
+    this.captionEl.className = "action-caption muted small-text";
+    row.append(this.approveBtn, this.denyBtn, this.captionEl);
 
     card.append(this.errorEl, row);
     this.card = card;
-    this.setArming(true);
     this.host.replaceChildren(card);
     this.host.hidden = false;
-    card.focus({ preventScroll: true });
+    card.scrollIntoView({ block: "nearest" });
+    card.focus({ preventScroll: true }); // the container, never Approve
 
-    window.clearTimeout(this.armTimer);
-    this.armTimer = window.setTimeout(() => {
-      this.armed = true;
-      if (!this.decided) this.setArming(false);
-    }, ARM_DELAY_MS);
+    if (this.diffEl) {
+      const d = this.diffEl;
+      this.scrollNeeded = d.scrollHeight - d.clientHeight > 2;
+      this.scrolledEnd = !this.scrollNeeded;
+    }
+
+    document.addEventListener("visibilitychange", this.env);
+    window.addEventListener("focus", this.env);
+    window.addEventListener("blur", this.env);
+    window.addEventListener("resize", this.env);
+    this.reevaluate();
 
     window.clearTimeout(this.expiryTimer);
     if (Number.isFinite(a.expires_in) && a.expires_in > 0) {
@@ -217,15 +373,64 @@ export class ActionCard {
     b.type = "button";
     b.className = "btn";
     b.dataset.label = `${label} (${key})`;
+    b.textContent = b.dataset.label;
     b.addEventListener("click", () => this.decide(d));
     return b;
   }
 
-  private setArming(arming: boolean): void {
-    for (const b of [this.approveBtn, this.denyBtn]) {
-      if (!b) continue;
-      b.disabled = arming;
-      b.textContent = arming ? "arming…" : b.dataset.label ?? "";
+  /** Approve only counts while the user could actually see and act on the card. */
+  private envOk(): boolean {
+    if (document.visibilityState !== "visible" || !document.hasFocus()) return false;
+    const b = this.approveBtn;
+    if (!b) return false;
+    const r = b.getBoundingClientRect();
+    return r.width > 0 && r.top >= 0 && r.left >= 0 && r.bottom <= window.innerHeight && r.right <= window.innerWidth;
+  }
+
+  private canApprove(): boolean {
+    return (
+      !this.decided &&
+      this.timeArmed &&
+      performance.now() - this.armStart >= ARM_DELAY_MS &&
+      this.scrolledEnd &&
+      this.envOk()
+    );
+  }
+
+  /** Re-check visibility/focus/scroll; (re)start the arm delay when conditions break. */
+  private reevaluate(): void {
+    if (!this.current || this.decided) return;
+    const d = this.diffEl;
+    if (d) {
+      this.scrollNeeded = d.scrollHeight - d.clientHeight > 2;
+      if (!this.scrollNeeded || d.scrollTop + d.clientHeight >= d.scrollHeight - 2) this.scrolledEnd = true;
+    }
+    if (!this.envOk()) {
+      window.clearTimeout(this.armTimer);
+      this.armTimer = undefined;
+      this.timeArmed = false;
+    } else if (!this.timeArmed && this.armTimer === undefined) {
+      this.armStart = performance.now();
+      this.armTimer = window.setTimeout(() => {
+        this.armTimer = undefined;
+        if (this.envOk()) this.timeArmed = true;
+        this.render();
+      }, ARM_DELAY_MS);
+    }
+    this.render();
+  }
+
+  private render(): void {
+    const a = this.approveBtn;
+    const d = this.denyBtn;
+    if (!a || !d) return;
+    const can = this.canApprove();
+    a.disabled = this.decided || !can;
+    a.textContent = this.timeArmed ? a.dataset.label ?? "" : "arming…";
+    d.disabled = this.decided; // Deny / Esc work immediately
+    if (this.hintEl) this.hintEl.hidden = !(this.scrollNeeded && !this.scrolledEnd);
+    if (this.captionEl) {
+      this.captionEl.textContent = !this.scrolledEnd ? "scroll to the end to enable Approve" : this.expiresText;
     }
   }
 
@@ -233,11 +438,10 @@ export class ActionCard {
   decide(d: Decision): boolean {
     const a = this.current;
     if (!a || this.decided) return false;
-    if (!this.armed || performance.now() - this.shownAt < ARM_DELAY_MS) return false;
+    if (d === "approve" && !this.canApprove()) return false;
     this.decided = true;
-    if (this.approveBtn) this.approveBtn.disabled = true;
-    if (this.denyBtn) this.denyBtn.disabled = true;
     if (this.errorEl) this.errorEl.hidden = true;
+    this.render();
     this.cb?.(a.id, d);
     return true;
   }
@@ -246,12 +450,12 @@ export class ActionCard {
   reenable(message: string): void {
     if (!this.current) return;
     this.decided = false;
-    this.setArming(false);
     if (this.errorEl) {
       this.errorEl.textContent = "";
-      appendEscaped(this.errorEl, message);
+      appendServerText(this.errorEl, message);
       this.errorEl.hidden = false;
     }
+    this.reevaluate();
   }
 
   /**
@@ -271,11 +475,14 @@ export class ActionCard {
     const foreignButton = t instanceof HTMLElement && !!t.closest("button, a[href]") && !this.contains(t);
     if (e.key === "Escape") {
       e.preventDefault();
-      // Esc never interrupts while a card is open; it only denies when armed
-      // and the event did not come from some other control.
-      if (!e.repeat && !foreignButton) this.decide("deny");
+      // Esc never interrupts while a card is open. It denies immediately
+      // (not arm-delayed) unless it is a repeat, an IME key, or came from
+      // some other control.
+      if (!e.repeat && !e.isComposing && !foreignButton) this.decide("deny");
       return true;
     }
+    if (e.isComposing || e.keyCode === 229) return false;
+    if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return false; // never approve via a chord
     // Enter on one of the card's own buttons is a native click on that button:
     // don't also approve (Enter on Deny must mean Deny).
     if (this.contains(t) && t instanceof HTMLElement && t.closest("button")) return false;
@@ -303,23 +510,28 @@ export class ActionCard {
   private dropCard(): void {
     window.clearTimeout(this.armTimer);
     window.clearTimeout(this.expiryTimer);
+    this.armTimer = undefined;
+    document.removeEventListener("visibilitychange", this.env);
+    window.removeEventListener("focus", this.env);
+    window.removeEventListener("blur", this.env);
+    window.removeEventListener("resize", this.env);
     const hadFocus = !!this.card && this.card.contains(document.activeElement);
     this.card = null;
     this.approveBtn = this.denyBtn = null;
-    this.errorEl = null;
+    this.errorEl = this.captionEl = this.diffEl = this.hintEl = null;
     this.current = null;
     this.decided = false;
-    this.armed = false;
+    this.timeArmed = false;
     this.host.replaceChildren();
     this.host.hidden = true;
     if (hadFocus && document.activeElement instanceof HTMLElement) document.activeElement.blur();
   }
 
-  /** Result text in the aria-live region for ~4 s. */
+  /** Result text in the single aria-live region for ~4 s. */
   showResult(text: string): void {
     window.clearTimeout(this.resultTimer);
     this.resultEl.textContent = "";
-    appendEscaped(this.resultEl, text);
+    appendServerText(this.resultEl, text);
     this.resultTimer = window.setTimeout(() => {
       this.resultEl.textContent = "";
     }, RESULT_MS);
