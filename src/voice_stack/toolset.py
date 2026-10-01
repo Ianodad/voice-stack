@@ -106,19 +106,23 @@ def _card_result_parts(m: dict, tool_call_id: str):
     return None
 
 
-def retire_card(session, card_id: str, outcome: str) -> int:
+def retire_card(session, card_id: str, outcome: str, *, inferred: bool = False) -> int:
     """Card `card_id` ended with `outcome` (done/denied/expired/failed/cleared). In the model's context,
     in place: (a) rewrite ONLY that card's own tool result (found by its tool_call_id, and only if it
     really is a card result) with the fixed outcome wording; (b) rewrite assistant text that claims a
     card, located after that result and before the next user message, with the card's own outcome
     wording. Nothing else is touched (file/web/list results can carry the magic words verbatim).
-    The first outcome recorded for a card wins. Never raises. Returns edits made."""
+    `inferred=True`: the caller only GUESSED the card ended (it vanished from pending); never applies to a
+    card that approve/deny took ('used'). The first outcome recorded for a card wins. Never raises."""
     n = 0
     try:
         card = session.cards.get(card_id)
         msgs = getattr(session.context, "messages", None)
         if card is None or not msgs:
             return 0
+        if inferred and session.pending.spent_reason(card_id, session.session_id) == "used":
+            return 0        # expiry was only INFERRED, but the card was taken by approve/deny and may still be
+                            # executing: its route settles it with the real outcome
         outcome = card.get("outcome") or (outcome if outcome in _OUTCOME_FACT else "cleared")
         card["outcome"] = outcome
         tc = card["tool_call_id"]
@@ -143,10 +147,15 @@ def retire_card(session, card_id: str, outcome: str) -> int:
                 m["content"] = new; n += 1
         if anchor is None:
             return n
+        others = {c["tool_call_id"] for k, c in session.cards.items() if k != card_id}
         for m in msgs[anchor + 1:]:
             if not isinstance(m, dict):
                 continue
-            if m.get("role") == "user":
+            # this card's window ends at the next user message, the model's next tool call (a later card
+            # starts there) or another card's own result
+            if m.get("role") == "user" or (m.get("role") == "assistant" and m.get("tool_calls")):
+                break
+            if m.get("role") in ("tool", "developer") and any(_card_result_parts(m, t) for t in others):
                 break
             c = m.get("content")
             if m.get("role") == "assistant" and not m.get("tool_calls") and isinstance(c, str) \
@@ -198,7 +207,7 @@ async def refresh_shown(session) -> bool:
         if session.pending.spent_reason(sid, session.session_id) == "used":
             return False
         session.shown_id = None
-        retire_card(session, sid, "expired")
+        retire_card(session, sid, "expired", inferred=True)
         return True
     except Exception:
         log.exception("refresh_shown failed")
@@ -474,7 +483,7 @@ def build(session: ToolSession) -> tuple[ToolsSchema, dict[str, Callable]]:
                 # propose succeeded although a card was shown: the old one expired and was swept
                 # silently. Clear it in the UI before the new card so nothing dead-ends.
                 await _push(params, {"type": "actions_cleared"})
-                retire_card(session, session.shown_id, "expired")
+                retire_card(session, session.shown_id, "expired", inferred=True)
                 session.shown_id = None
             if not await _push(params, {"type": "pending_action", "action": p.public()}):
                 try:

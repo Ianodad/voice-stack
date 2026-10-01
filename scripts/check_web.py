@@ -498,9 +498,14 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
     for name in ("r1", "r2", "r3", "r4"):
         (notes / f"{name}.txt").write_text(name + "\n")
     mv = lambda n: pend.propose(sid, "move", {"src": f"notes/{n}.txt", "dst": f"archive/{n}.txt"})
+    cx.add_message({"role": "user", "content": "earlier question"})
+    left = len(cx.messages)
+    cx.add_message({"role": "assistant", "content": CLAIM})              # a leftover claim outside any card's window
+    cx.add_message({"role": "user", "content": "change something"})
     p = mv("r1"); ts.shown_id = p.id; i = seed(p.id)
     assert (await http.post(f"{base}/api/actions/{p.id}/approve", json={})).status_code == 200
     scrubbed(i, "WAS applied", "the user approved it")
+    assert cx.messages[left]["content"] == _ts.NEUTRAL_SAY, cx.messages[left]   # the route settles leftovers too
     p = mv("r2"); ts.shown_id = p.id; i = seed(p.id)
     assert (await http.post(f"{base}/api/actions/{p.id}/deny", json={})).status_code == 200
     scrubbed(i, "denied by the user", "the user denied it")
@@ -535,6 +540,40 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
     assert ts.shown_id == "B-live"                                               # B's card and traces untouched
     assert _ts.SPEAK_DENIED_LIVE in spoken(frames[n_before:]) and _ts.SPEAK_DENIED not in spoken(frames[n_before:])
     ts.shown_id = None
+    # the approve ROUTE is cancelled (client disconnect) while the apply thread runs: the card still ends
+    # with its real outcome and the marker is cleared (route work runs in one shielded task)
+    import threading
+    import voice_stack.tools as _tools
+    (notes / "r7.txt").write_text("alpha\n")
+    p = pend.propose(sid, "edit", {"path": "notes/r7.txt", "old_text": "alpha", "new_text": "beta"})
+    ts.shown_id = p.id; i = seed(p.id)
+    started, release = threading.Event(), threading.Event()
+    real_apply = _tools.apply_edit
+    def slow_apply(*a, **k):
+        started.set(); release.wait(10); return real_apply(*a, **k)
+    _tools.apply_edit = slow_apply
+    try:
+        ep = next(r.endpoint for r in app.routes if getattr(r, "path", "") == "/api/actions/{action_id}/approve")
+        t = asyncio.create_task(ep(p.id))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        assert ts.shown_id == p.id and pend.spent_reason(p.id, sid) == "used"      # still applying
+        release.set()
+        for _ in range(100):
+            if ts.shown_id is None:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        _tools.apply_edit = real_apply
+        release.set()
+    assert ts.shown_id is None and (notes / "r7.txt").read_text() == "beta\n", (ts.shown_id,)
+    scrubbed(i, "WAS applied", "the user approved it")
+    assert ts.cards[p.id]["outcome"] == "done"
     print("actions: real routes scrub the real context per outcome (done/denied/failed/expired/timeout): ok")
 
     # foreign session id: 404, and the other session's action stays pending
@@ -594,7 +633,17 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
 
     # session ends (stop): pending discarded; approve with no session -> 409
     p2 = pend.propose(sid2, "move", {"src": "notes/f.txt", "dst": "archive/f.txt"})
+    ts2 = sessions._current.tool_session
+    if ts2.context is None:
+        from pipecat.processors.aggregators.llm_context import LLMContext as _LC
+        ts2.context = _LC()
+    ts2.cards[p2.id] = {"tool_call_id": "td-" + p2.id, "outcome": None}
+    ts2.context.add_messages([{"role": "tool", "tool_call_id": "td-" + p2.id,
+                               "content": json.dumps({"status": "awaiting_user_confirmation"})}])
+    ts2.shown_id = p2.id
     await sessions.stop()
+    td = ts2.context.messages[-1]["content"]
+    assert "cancelled: nothing changed" in td and "awaiting_user_confirmation" not in td, td   # teardown scrubs 'cleared'
     assert pend.list(sid2) == [], "pending survived session stop"
     assert any(m["type"] == "actions_cleared" for m in msgs(new_frames)), "no actions_cleared on stop"
     r = await http.post(f"{base}/api/actions/{p2.id}/approve", json={})

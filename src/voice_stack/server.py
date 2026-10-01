@@ -369,11 +369,14 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
                 speak=_SPEAK_FAILED,
             )
 
-    @app.post("/api/actions/{action_id}/approve")
-    async def approve_action(action_id: str):
-        sid = sessions.current_session_id()     # captured at request time
-        if sid is None:
-            return JSONResponse({"detail": "no active session"}, status_code=409)
+    async def _shielded(coro):
+        """Run the route's work (thread call + bookkeeping) as ONE task that survives cancellation of
+        the request (client disconnect): the card always ends with its real outcome."""
+        task = asyncio.ensure_future(coro)
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())   # mark exception retrieved
+        return await asyncio.shield(task)
+
+    async def _approve(action_id: str, sid: str):
         try:
             result = await asyncio.to_thread(pending.approve, action_id, sid)
         except ActionError as e:
@@ -392,11 +395,14 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
             )
         return {"status": "done", "id": action_id, "summary": summary}
 
-    @app.post("/api/actions/{action_id}/deny")
-    async def deny_action(action_id: str):
-        sid = sessions.current_session_id()
+    @app.post("/api/actions/{action_id}/approve")
+    async def approve_action(action_id: str):
+        sid = sessions.current_session_id()     # captured at request time
         if sid is None:
             return JSONResponse({"detail": "no active session"}, status_code=409)
+        return await _shielded(_approve(action_id, sid))
+
+    async def _deny(action_id: str, sid: str):
         try:
             await asyncio.to_thread(pending.deny, action_id, sid)
         except ActionError as e:
@@ -410,6 +416,13 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
                 speak=SPEAK_DENIED if alone else SPEAK_DENIED_LIVE,
             )
         return {"status": "denied", "id": action_id}
+
+    @app.post("/api/actions/{action_id}/deny")
+    async def deny_action(action_id: str):
+        sid = sessions.current_session_id()
+        if sid is None:
+            return JSONResponse({"detail": "no active session"}, status_code=409)
+        return await _shielded(_deny(action_id, sid))
 
     @app.post("/api/offer")
     async def offer(request: Request, conversation_id: str | None = None):

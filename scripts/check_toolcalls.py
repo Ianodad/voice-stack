@@ -178,14 +178,14 @@ async def unit_guard():
     print("unit guard ok")
 
 
-async def hcall(root, pend, name, args, ctx=None, session=None, llm=None):
+async def hcall(root, pend, name, args, ctx=None, session=None, llm=None, tcid="1"):
     session = session or toolset.ToolSession(f"H-{name}-{time.monotonic_ns()}", root, pend)
     llm = llm or Frames()
     _, handlers = toolset.build(session)
     out = {}
 
     async def cb(result, properties=None): out["r"] = result
-    await handlers[name](SimpleNamespace(function_name=name, tool_call_id="1", arguments=args, llm=llm,
+    await handlers[name](SimpleNamespace(function_name=name, tool_call_id=tcid, arguments=args, llm=llm,
                                          pipeline_worker=None, context=ctx, result_callback=cb,
                                          app_resources=session))
     return out.get("r"), session, llm
@@ -891,6 +891,148 @@ async def live_card_followups(client, tools_fmt, samples: int) -> dict:
     return rows
 
 
+async def unit_round3():
+    """Fix round 3: new proposal mid-approve, two cards in one turn, expired-at-propose, settle guards."""
+    import threading
+    CLAIM = "A confirmation card is on screen waiting for your approval."
+    edit = {"path": "config.txt", "old_text": "load > 5", "new_text": "load > 8"}
+    edit2 = {"path": "config.txt", "old_text": "retries: 3", "new_text": "retries: 5"}
+    with tempfile.TemporaryDirectory() as d:
+        root = make_root(d)
+
+        # --- 1. card B proposed while A's approval is still applying: A must end 'done', never 'expired'
+        pend = PendingActions(root)
+        ctx, ix = card_ctx()
+        ses = toolset.ToolSession("R3a", root, pend); ses.context = ctx
+        await hcall(root, pend, "edit_file", edit, uctx("change it"), ses)
+        a_id = ses.shown_id
+        started, release = threading.Event(), threading.Event()
+        real_apply = T.apply_edit
+        def slow(*a, **k):
+            started.set(); release.wait(5); return real_apply(*a, **k)
+        T.apply_edit = slow
+        try:
+            task = asyncio.create_task(asyncio.to_thread(pend.approve, a_id, "R3a"))
+            while not started.is_set(): await asyncio.sleep(0.01)
+            r, _, _ = await hcall(root, pend, "edit_file", edit2, ctx, ses, tcid="2")      # B, mid-approve
+            assert r["status"] == "awaiting_user_confirmation" and ses.shown_id != a_id, r
+            assert "awaiting_user_confirmation" in card_text(ctx.messages[5]), "A was scrubbed while in flight"
+            release.set(); await task
+        finally:
+            T.apply_edit = real_apply
+        toolset.retire_card(ses, a_id, "done"); toolset.settle_cards(ses)                 # the approve route's settle
+        assert "WAS applied" in ctx.messages[5]["content"] and "the user approved it" in ctx.messages[ix["claim"]]["content"]
+        assert "expired" not in json.dumps(ctx.messages) and ses.cards[a_id]["outcome"] == "done"
+        pend.discard_session("R3a")
+
+        (root / "config.txt").write_text("name: web\nalert when load > 5\nretries: 3\n")
+        # --- P. a card that EXPIRED is scrubbed 'expired' when a new proposal sweeps it (propose-time retire)
+        now = [1000.0]
+        pend = PendingActions(root, clock=lambda: now[0], ttl=300.0)
+        ctx, ix = card_ctx()
+        ses = toolset.ToolSession("R3b", root, pend); ses.context = ctx
+        await hcall(root, pend, "edit_file", edit, uctx("change it"), ses)
+        now[0] += 301
+        r, _, _ = await hcall(root, pend, "edit_file", edit2, ctx, ses, tcid="2")
+        assert r["status"] == "awaiting_user_confirmation"
+        assert "expired: nothing changed" in ctx.messages[5]["content"], ctx.messages[5]
+        assert "it expired" in ctx.messages[ix["claim"]]["content"]
+        pend.discard_session("R3b")
+
+        # --- 2. two cards in one user turn: each card's text gets ITS OWN outcome (both directions)
+        def two():
+            m = [{"role": "user", "content": "q"},
+                 {"role": "assistant", "content": None, "tool_calls": [{"id": "t1", "function": {"name": "edit_file"}}]},
+                 {"role": "tool", "tool_call_id": "t1", "content": json.dumps({"status": "awaiting_user_confirmation", "n": 1})},
+                 {"role": "assistant", "content": CLAIM + " (A)"},
+                 {"role": "assistant", "content": None, "tool_calls": [{"id": "t2", "function": {"name": "edit_file"}}]},
+                 {"role": "tool", "tool_call_id": "t2", "content": json.dumps({"status": "awaiting_user_confirmation", "n": 2})},
+                 {"role": "assistant", "content": CLAIM + " (B)"}]
+            c = SimpleNamespace(messages=m)
+            s_ = toolset.ToolSession("TWO", root, PendingActions(root)); s_.context = c
+            s_.cards["A"] = {"tool_call_id": "t1", "outcome": None}; s_.cards["B"] = {"tool_call_id": "t2", "outcome": None}
+            s_.shown_id = "B"                                                  # B is the live card
+            return s_, m
+        for first, second in (("done", "denied"), ("denied", "done")):
+            s_, m = two()
+            toolset.retire_card(s_, "A", first); toolset.settle_cards(s_)      # A resolved mid-turn, B live
+            assert "awaiting_user_confirmation" in m[5]["content"] and m[6]["content"] == CLAIM + " (B)", m[5:]
+            assert toolset.claims_card(m[6]["content"]) and "(A)" not in m[3]["content"]
+            s_.shown_id = None
+            toolset.retire_card(s_, "B", second); toolset.settle_cards(s_)
+            fact = lambda o: toolset._RETIRED_SAY[o]
+            assert m[3]["content"] == fact(first) and m[6]["content"] == fact(second), (first, second, m)
+            assert toolset._OUTCOME_FACT[first][0] in m[2]["content"] and toolset._OUTCOME_FACT[second][0] in m[5]["content"]
+
+        # --- window edges, each on its own (so one break cannot hide the loss of another)
+        def win(msgs_):
+            c_ = SimpleNamespace(messages=msgs_)
+            s_ = toolset.ToolSession("WIN", root, PendingActions(root)); s_.context = c_
+            s_.cards["A"] = {"tool_call_id": "t1", "outcome": None}
+            return s_, msgs_
+        res_a = {"role": "tool", "tool_call_id": "t1", "content": json.dumps({"status": "awaiting_user_confirmation"})}
+        # W1: a claim after the NEXT USER message is outside A's window (retire_card alone must not touch it)
+        s_, m = win([{"role": "assistant", "content": None, "tool_calls": [{"id": "t1", "function": {"name": "e"}}]},
+                     dict(res_a), {"role": "user", "content": "next"}, {"role": "assistant", "content": CLAIM + " X"}])
+        toolset.retire_card(s_, "A", "done")
+        assert m[3]["content"] == CLAIM + " X", m[3]
+        # W3: a claim after the model's NEXT TOOL CALL (a later card starts there; its result not in yet)
+        s_, m = win([{"role": "assistant", "content": None, "tool_calls": [{"id": "t1", "function": {"name": "e"}}]},
+                     dict(res_a), {"role": "assistant", "content": CLAIM + " A"},
+                     {"role": "assistant", "content": None, "tool_calls": [{"id": "t2", "function": {"name": "e"}}]},
+                     {"role": "assistant", "content": CLAIM + " B"}])
+        toolset.retire_card(s_, "A", "done")
+        assert m[2]["content"] == toolset._RETIRED_SAY["done"] and m[4]["content"] == CLAIM + " B", m
+        # W4: another tracked card's own result ends the window even with no tool_calls message before it
+        s_, m = win([{"role": "assistant", "content": None, "tool_calls": [{"id": "t1", "function": {"name": "e"}}]},
+                     dict(res_a), {"role": "assistant", "content": CLAIM + " A"},
+                     {"role": "tool", "tool_call_id": "t2", "content": json.dumps({"status": "awaiting_user_confirmation"})},
+                     {"role": "assistant", "content": CLAIM + " B"}])
+        s_.cards["B"] = {"tool_call_id": "t2", "outcome": None}
+        toolset.retire_card(s_, "A", "done")
+        assert m[2]["content"] == toolset._RETIRED_SAY["done"] and m[4]["content"] == CLAIM + " B" \
+            and "awaiting_user_confirmation" in m[3]["content"], m
+
+        # --- L1: the false-card backstop never invents an outcome for a card it knows nothing about
+        s_, m = win([{"role": "assistant", "content": None, "tool_calls": [{"id": "t1", "function": {"name": "e"}}]},
+                     dict(res_a), {"role": "user", "content": "q"}, {"role": "assistant", "content": CLAIM}])
+        sent2 = []
+        async def q3(f): sent2.append(f)
+        from voice_stack import bot as _bot
+        assert await _bot.false_card_backstop(s_, CLAIM, q3) is True
+        assert "awaiting_user_confirmation" in m[1]["content"] and s_.cards["A"]["outcome"] is None, (m[1], s_.cards)
+        assert m[3]["content"] == toolset.NEUTRAL_SAY
+
+        # --- Z1: settle_cards must not neutralise claims while a proposal is in flight
+        ctx = SimpleNamespace(messages=[{"role": "user", "content": "q"}, {"role": "assistant", "content": CLAIM}])
+        ses = toolset.ToolSession("Z1", root, PendingActions(root)); ses.context = ctx
+        ses.proposing = 1
+        toolset.settle_cards(ses)
+        assert ctx.messages[1]["content"] == CLAIM, "claim neutralised while a proposal is in flight"
+        ses.proposing = 0
+        toolset.settle_cards(ses)
+        assert ctx.messages[1]["content"] == toolset.NEUTRAL_SAY
+
+        # --- S4: developer-path results are matched by tool_call_id inside the payload
+        from pipecat.processors.aggregators.async_tool_messages import build_final_result_message, build_started_message
+        res = json.dumps({"status": "awaiting_user_confirmation"})
+        m = [{"role": "user", "content": "q"},
+             {"role": "assistant", "content": None, "tool_calls": [{"id": "t1", "function": {"name": "edit_file"}}]},
+             build_started_message("t1"), build_final_result_message("t1", res),
+             {"role": "assistant", "content": None, "tool_calls": [{"id": "t2", "function": {"name": "edit_file"}}]},
+             build_started_message("t2"), build_final_result_message("t2", res)]
+        c = SimpleNamespace(messages=m)
+        ses = toolset.ToolSession("S4", root, PendingActions(root)); ses.context = c
+        ses.cards["A"] = {"tool_call_id": "t1", "outcome": None}; ses.cards["B"] = {"tool_call_id": "t2", "outcome": None}
+        other = json.dumps(m[6]); started_b = json.dumps(m[5]); started_a = json.dumps(m[2])
+        assert toolset.retire_card(ses, "A", "done") == 1
+        assert "WAS applied" in card_text(m[3]) and json.dumps(m[6]) == other and json.dumps(m[5]) == started_b
+        assert json.dumps(m[2]) == started_a                                  # 'started' placeholder untouched
+        toolset.retire_card(ses, "B", "denied")
+        assert "denied by the user" in card_text(m[6]) and "WAS applied" in card_text(m[3])
+    print("unit round3 ok")
+
+
 async def main():
     web.web_search, web.fetch_page = fake_search, fake_fetch
     if "--skip-unit" not in sys.argv:    # (only for running the live rows against older code)
@@ -898,6 +1040,7 @@ async def main():
         await unit_handlers()
         await unit_backstop()
         await unit_round1()
+        await unit_round3()
     if "--unit" in sys.argv:
         print("check_toolcalls.py --unit: PASS"); return
     own = None
