@@ -265,8 +265,10 @@ async def unit_sweep() -> None:
     print("expired-card sweep pushes actions_cleared before the new card: ok")
 
 
-FIXED_SPOKEN = {"Done. I moved the file.", "Done. I saved the edit.", "Okay, I won't.",
-                "That did not work. Nothing was changed."}
+from voice_stack import toolset as _ts  # noqa: E402  (the server's fixed spoken lines)
+
+FIXED_SPOKEN = {_ts.SPEAK_DONE["move"], _ts.SPEAK_DONE["edit"], _ts.SPEAK_DENIED, _ts.SPEAK_FAILED,
+                _ts.SPEAK_EXPIRED, _ts.SPEAK_DONE_DEFAULT}
 
 
 async def actions_section(base, http, app, sessions, root: Path) -> None:
@@ -347,7 +349,7 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
     assert (arch / "a.txt").exists() and not (notes / "a.txt").exists(), "move did not happen"
     res = msgs(frames, "action_result")
     assert res and res[-1]["status"] == "done" and res[-1]["id"] == p.id and res[-1]["summary"], res
-    assert "Done. I moved the file." in spoken(frames), spoken(frames)
+    assert _ts.SPEAK_DONE["move"] in spoken(frames), spoken(frames)
     assert any(f.append_to_context for f in frames if isinstance(f, TTSSpeakFrame) and f.text.startswith("Done."))
     r = await http.post(f"{base}/api/actions/{p.id}/approve", json={})
     assert r.status_code == 409 and r.json().get("error") == "already handled", (r.status_code, r.text)
@@ -370,7 +372,7 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
     assert r.status_code == 200, (r.status_code, r.text)
     assert (notes / "c.txt").exists() and not (arch / "c.txt").exists(), "denied action ran"
     assert msgs(frames, "action_result")[-1] == {"type": "action_result", "id": p.id, "status": "denied"}
-    assert "Okay, I won't." in spoken(frames)
+    assert _ts.SPEAK_DENIED in spoken(frames)
     assert (await http.post(f"{base}/api/actions/{p.id}/deny", json={})).status_code == 409
     assert (await http.post(f"{base}/api/actions/{p.id}/approve", json={})).status_code == 409
     print("actions: deny ok, nothing executed: ok")
@@ -385,7 +387,7 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
     p = pend.propose(sid, "edit", {"path": "notes/h.txt", "old_text": "alpha", "new_text": "ALPHA"})
     r = await http.post(f"{base}/api/actions/{p.id}/approve", json={})
     assert r.status_code == 200 and (notes / "h.txt").read_text() == "ALPHA beta\n", (r.status_code, r.text)
-    assert "Done. I saved the edit." in spoken(frames), spoken(frames)
+    assert _ts.SPEAK_DONE["edit"] in spoken(frames), spoken(frames)
     ctx_texts = [f.text for f in frames if isinstance(f, TTSSpeakFrame) and f.append_to_context]
     assert ctx_texts and set(ctx_texts) <= FIXED_SPOKEN, ctx_texts
     assert not any("ignore" in t.lower() or "h.txt" in t or "g.txt" in t for t in spoken(frames)), spoken(frames)
@@ -401,7 +403,7 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
     assert r.status_code == 422, (r.status_code, r.text)
     new = msgs(frames[n_before:], "action_result")
     assert len(new) == 1 and new[0]["status"] == "failed" and new[0]["id"] == p.id, new
-    assert "That did not work. Nothing was changed." in spoken(frames[n_before:]), spoken(frames[n_before:])
+    assert _ts.SPEAK_FAILED in spoken(frames[n_before:]), spoken(frames[n_before:])
     assert live.tool_session.shown_id is None
     assert (await http.post(f"{base}/api/actions/{p.id}/approve", json={})).status_code == 409
     assert pend.list(sid) == []

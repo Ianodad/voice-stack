@@ -83,12 +83,15 @@ class Frames:
     async def push_frame(self, f, *a, **k): self.frames.append(f)
 
 
-async def run_case(client, tools_fmt, root, pending, text):
-    session = toolset.ToolSession(f"S-{abs(hash(text))}", root, pending)
+async def run_case(client, tools_fmt, root, pending, text, session=None, messages=None):
+    """One user turn. Pass `session`/`messages` (mutated in place) to continue a conversation."""
+    session = session or toolset.ToolSession(f"S-{abs(hash(text))}", root, pending)
     _schema, handlers = toolset.build(session)
-    # production registers move/edit with cancel_on_interruption=False, so Pipecat appends this block
-    messages = [{"role": "system", "content": toolset.system_prompt(date.today(), root) + "\n\n" + ASYNC_TOOL_INSTRUCTIONS},
-                {"role": "user", "content": text}]
+    if messages is None:
+        # production registers move/edit with cancel_on_interruption=False, so Pipecat appends this block
+        messages = [{"role": "system", "content": toolset.system_prompt(date.today(), root) + "\n\n" + ASYNC_TOOL_INSTRUCTIONS}]
+    messages.append({"role": "user", "content": text})
+    session.reset_turn()
     calls, results, final = [], [], ""
     llm = Frames()
     for _ in range(MAX_LOOP):
@@ -120,6 +123,8 @@ async def run_case(client, tools_fmt, root, pending, text):
             calls.append(tc.function.name); results.append(out.get("r"))
             messages.append({"role": "tool", "tool_call_id": tc.id,
                              "content": json.dumps(out.get("r"), ensure_ascii=False)})
+    if final:
+        messages.append({"role": "assistant", "content": final})   # the spoken reply enters context
     return session, calls, results, final, llm
 
 
@@ -413,10 +418,138 @@ async def unit_handlers():
     print("unit handlers ok")
 
 
+DENY_SAY = toolset.SPEAK_DENIED   # the server's fixed denied line
+DENY_ASK = "change load greater than 5 to load greater than 8 in the config file"
+
+
+async def live_deny_retry(client, tools_fmt, samples: int) -> tuple[int, list[str]]:
+    """Multi-turn: ask for an edit, DENY the card (as the server does), ask again in the SAME
+    conversation. Each sample must produce a NEW pending card (a real tool call), not a repeat of
+    the old 'confirmation card is on screen' text. Returns (successes, failure notes)."""
+    ok, notes = 0, []
+    for i in range(samples):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            (root / "archive").mkdir()
+            (root / "e2e-config.txt").write_text("name: web\nalert when load > 5\nretries: 3\n")
+            pend = PendingActions(root)
+            session = toolset.ToolSession(f"DENY-{i}", root, pend)
+            msgs = []
+            _, c1, _, f1, _ = await run_case(client, tools_fmt, root, pend, DENY_ASK, session, msgs)
+            cards = pend.list(session.session_id)
+            if len(cards) != 1 or cards[0]["kind"] != "edit":
+                notes.append(f"sample {i}: turn 1 gave no edit card (calls={c1}, reply={f1[:60]!r})")
+                pend.discard_session(session.session_id); continue
+            pend.deny(cards[0]["id"], session.session_id)          # the user clicks Deny
+            session.shown_id = None
+            toolset.retire_cards(SimpleNamespace(messages=msgs))   # server scrubs the stale card traces
+            msgs.append({"role": "assistant", "content": DENY_SAY})  # then appends its fixed line
+            before = snapshot(root)
+            _, c2, _, f2, _ = await run_case(client, tools_fmt, root, pend, DENY_ASK, session, msgs)
+            cards2 = pend.list(session.session_id)
+            assert snapshot(root) == before, "file changed without approval"
+            if len(cards2) == 1 and cards2[0]["kind"] == "edit" and "edit_file" in c2:
+                ok += 1
+            else:
+                notes.append(f"sample {i}: turn 2 NO new card (calls={c2}, reply={f2[:80]!r}, claims_card={getattr(toolset, 'claims_card', lambda t: None)(f2)})")
+            pend.discard_session(session.session_id)
+    return ok, notes
+
+
+async def unit_backstop():
+    """Deterministic: false 'confirmation card' claim detection, stale-card scrubbing, bot backstop."""
+    from voice_stack import bot
+    claims = ["A confirmation card is on screen waiting for your approval. The change has not happened yet.",
+              "I've put a confirmation card on screen.", "The card is on screen, please approve it.",
+              "It is waiting for your approval.", "Waiting for your confirmation on the screen.",
+              "Please confirm the change on screen.", "A CONFIRMATION CARD is up."]
+    non = ["Done. I saved the edit.", "Okay, I won't.", "I can't delete files, but I can move them to archive.",
+           "The code is on screen.", "Kenya's parliament debated the bill today.", "",
+           toolset.SPEAK_DENIED, toolset.SPEAK_CORRECTION, toolset.SPEAK_EXPIRED,
+           "You denied the confirmation card, so nothing happened.", "The confirmation card expired.",
+           "There is no confirmation card on screen."]
+    for t in claims:
+        assert toolset.claims_card(t), t
+    for t in non:
+        assert not toolset.claims_card(t), t
+    assert not toolset.claims_card(None)
+
+    # retire_cards: stale tool result + stale assistant claim are scrubbed; real text is untouched
+    ctx = SimpleNamespace(messages=[
+        {"role": "user", "content": "edit it"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "1", "function": {"name": "edit_file"}}]},
+        {"role": "tool", "tool_call_id": "1", "content": json.dumps({"status": "awaiting_user_confirmation"})},
+        {"role": "assistant", "content": "A confirmation card is on screen waiting for your approval."},
+        {"role": "assistant", "content": toolset.SPEAK_DENIED},
+        {"role": "assistant", "content": "Kenya news is fine."}])
+    assert toolset.retire_cards(ctx) == 2
+    assert "awaiting_user_confirmation" not in ctx.messages[2]["content"] and "closed" in ctx.messages[2]["content"]
+    assert "card" not in ctx.messages[3]["content"] and ctx.messages[4]["content"] == toolset.SPEAK_DENIED
+    assert ctx.messages[5]["content"] == "Kenya news is fine." and ctx.messages[1]["content"] is None
+    assert toolset.retire_cards(None) == 0 and toolset.retire_cards(SimpleNamespace(messages=None)) == 0
+
+    with tempfile.TemporaryDirectory() as d:
+        root = make_root(d)
+        pend = PendingActions(root)
+        sent = []
+
+        async def queue(frame): sent.append(frame)
+        def kinds(): return [("speak", f.text) if isinstance(f, TTSSpeakFrame) else ("rtvi", f.data["type"]) for f in sent]
+        say = "A confirmation card is on screen waiting for your approval."
+
+        ses = toolset.ToolSession("BS", root, pend)
+        ses.context = SimpleNamespace(messages=[{"role": "assistant", "content": say}])
+        # 1. false claim, nothing pending, no proposal this turn -> corrected exactly once
+        assert await bot.false_card_backstop(ses, say, queue) is True
+        assert kinds() == [("rtvi", "actions_cleared"), ("speak", toolset.SPEAK_CORRECTION)], kinds()
+        assert sent[1].append_to_context is True
+        assert "card" not in ses.context.messages[0]["content"]          # its stale trace was scrubbed too
+        assert await bot.false_card_backstop(ses, say, queue) is False and len(sent) == 2   # once per turn
+        assert await bot.false_card_backstop(ses, toolset.SPEAK_CORRECTION, queue) is False  # never on its own line
+        ses.reset_turn()                                                  # next turn: armed again
+        sent.clear()
+        assert await bot.false_card_backstop(ses, say, queue) is True and len(sent) == 2
+        # 2. non-claim text -> silent
+        ses.reset_turn(); sent.clear()
+        for t in non + ["Search found three results."]:
+            assert await bot.false_card_backstop(ses, t, queue) is False, t
+        assert sent == []
+        # 3. legit: a real proposal this turn (pending exists, proposed_turn set) -> never corrected
+        ses2 = toolset.ToolSession("BS2", root, pend)
+        r, _, _ = await hcall(root, pend, "edit_file", {"path": "config.txt", "old_text": "load > 5", "new_text": "load > 8"},
+                              uctx("change it"), ses2)
+        assert r["status"] == "awaiting_user_confirmation" and ses2.proposed_turn and pend.list("BS2")
+        assert await bot.false_card_backstop(ses2, say, queue) is False and sent == []
+        # 4. legit on a LATER turn: card still pending (user has not clicked) -> never corrected
+        ses2.reset_turn()
+        assert not ses2.proposed_turn and pend.list("BS2")
+        assert await bot.false_card_backstop(ses2, say, queue) is False and sent == []
+        # 5. after the card is denied (nothing pending), the same text IS corrected
+        pend.deny(pend.list("BS2")[0]["id"], "BS2"); ses2.shown_id = None
+        assert await bot.false_card_backstop(ses2, say, queue) is True and len(sent) == 2
+        # 6. no tools session (non-tools mode) -> never
+        assert await bot.false_card_backstop(None, say, queue) is False
+        # 7. queue failure never raises
+        ses3 = toolset.ToolSession("BS3", root, pend)
+        async def boom(frame): raise RuntimeError("down")
+        assert await bot.false_card_backstop(ses3, say, boom) is False
+        # 8. the turn handler wires it: finished assistant turn with a false claim queues the correction
+        sent.clear(); ses4 = toolset.ToolSession("BS4", root, pend)
+        h = bot.make_assistant_turn_handler(bot.ReplyTap(), SimpleNamespace(messages=[]), None, ses4, queue)
+        await h(None, SimpleNamespace(content=say, interrupted=False))
+        assert kinds() == [("rtvi", "actions_cleared"), ("speak", toolset.SPEAK_CORRECTION)], kinds()
+        sent.clear()
+        await h(None, SimpleNamespace(content=toolset.SPEAK_CORRECTION, interrupted=False))   # the correction's own turn
+        assert sent == []
+        pend.discard_session("BS2")
+    print("unit backstop ok")
+
+
 async def main():
     web.web_search, web.fetch_page = fake_search, fake_fetch
     await unit_guard()
     await unit_handlers()
+    await unit_backstop()
     if "--unit" in sys.argv:
         print("check_toolcalls.py --unit: PASS"); return
     own = None
@@ -438,7 +571,13 @@ async def main():
             pending = PendingActions(root)
             schema, _ = toolset.build(toolset.ToolSession("x", root, pending))
             tools_fmt = OpenAILLMAdapter().to_provider_tools_format(schema)
-            for text, expect in CASES:
+            n = int(sys.argv[sys.argv.index("--samples") + 1]) if "--samples" in sys.argv else 5
+            ok_n, notes = await live_deny_retry(client, tools_fmt, n)
+            print(f"deny-then-reask: {ok_n}/{n} produced a new edit card")
+            for m in notes: print("   ", m)
+            if ok_n < n:
+                warns.append(f"deny-then-reask only {ok_n}/{n}")
+            for text, expect in ([] if "--deny-only" in sys.argv else CASES):
                 before = snapshot(root)
                 session, calls, results, final, _ = await run_case(client, tools_fmt, root, pending, text)
                 cards = pending.list(session.session_id)
@@ -480,7 +619,7 @@ async def main():
         if own is not None:
             own.stop()
         logdir.cleanup()
-    print(f"\ntool-choice score: {score}/{len(CASES)}")
+    print(f"\ntool-choice score: {score}/{0 if '--deny-only' in sys.argv else len(CASES)}")
     for w in warns: print("WARN", w)
     for f in fails: print("FAIL", f)
     if fails:

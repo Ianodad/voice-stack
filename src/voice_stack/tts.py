@@ -26,6 +26,7 @@ from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 
 from voice_stack.fence import CODE_CUE, FenceAggregator
+from voice_stack.speech_text import speech_transform
 
 
 class MLXKokoroTTSService(TTSService):
@@ -51,6 +52,10 @@ class MLXKokoroTTSService(TTSService):
         # Fenced code is never spoken: type "code" is skipped by TTS (it still
         # flows downstream to the client and LLM context).
         kwargs.setdefault("skip_aggregator_types", ["code"])
+        # Markdown is never spoken: strip it from the text sent to run_tts (the transcript and the
+        # LLM context keep the original -- why a transform, not text_filters, whose output also
+        # lands in the context). Transforms run after the code skip above.
+        kwargs.setdefault("text_transforms", [("*", speech_transform)])
         super().__init__(
             push_start_frame=True,
             push_stop_frames=True,
@@ -76,6 +81,8 @@ class MLXKokoroTTSService(TTSService):
         return True
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
+        if not text.strip():   # a chunk that was only markdown marks: nothing to say
+            return
         loop = asyncio.get_running_loop()
         # model.generate() is a lazy generator (one GenerationResult per
         # sentence-internal chunk). Step it one chunk at a time on the shared

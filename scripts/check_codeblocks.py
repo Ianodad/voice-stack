@@ -186,8 +186,9 @@ async def main():
     )
     assert codes(outputs) == [], codes(outputs)
     joined = " ".join(spoken)
-    assert "`print`" in joined and "`x.run()`" in joined and "indented line is prose" in joined, spoken
-    assert "```triple```" in joined and "Done." in joined, spoken
+    # markdown marks are stripped from the SPOKEN text only (speech layer); the words stay
+    assert "Use the print function" in joined and "x.run()" in joined and "`" not in joined, spoken
+    assert "indented line is prose" in joined and "triple" in joined and "Done." in joined, spoken
     assert CODE_CUE not in spoken
     print("inline/indented ok")
 

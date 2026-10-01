@@ -1,11 +1,13 @@
 """Pipeline factory: builds one per-session PipelineWorker from a Runtime."""
 
+import asyncio
 from collections import Counter
 from collections.abc import Callable
 from datetime import date
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMFullResponseStartFrame, LLMTextFrame
+from pipecat.frames.frames import LLMFullResponseStartFrame, LLMTextFrame, TTSSpeakFrame
+from pipecat.processors.frameworks.rtvi import RTVIServerMessageFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.frame_processor import FrameProcessor
@@ -16,6 +18,8 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.turns.user_mute import AlwaysUserMuteStrategy
+
+from loguru import logger
 
 from voice_stack import toolset
 from voice_stack.fence import CUES, LOCAL_CODE_CUE, print_code_block
@@ -83,14 +87,39 @@ def reply_content(tap: ReplyTap, context: LLMContext, message) -> str:
     return full
 
 
+async def false_card_backstop(tools, text: str | None, queue) -> bool:
+    """Tools mode: the finished assistant turn claims a confirmation card, yet no card is pending and
+    none was proposed this turn -> the model repeated an old reply. Queue a fixed correction (it
+    enters context as the assistant's words) and clear the UI's cards. At most once per turn.
+    `queue(frame)` awaits worker.queue_frame. Never raises. Returns True when it fired."""
+    try:
+        if tools is None or tools.corrected_turn or tools.proposed_turn or tools.shown_id is not None:
+            return False
+        if text == toolset.SPEAK_CORRECTION or not toolset.claims_card(text):
+            return False
+        if await asyncio.to_thread(tools.pending.list, tools.session_id):
+            return False        # a real card is pending: the claim is true
+        tools.corrected_turn = True
+        toolset.retire_cards(tools.context)
+        await queue(RTVIServerMessageFrame(data={"type": "actions_cleared"}))
+        await queue(TTSSpeakFrame(toolset.SPEAK_CORRECTION, append_to_context=True))
+        return True
+    except Exception:
+        logger.exception("false-card backstop failed")
+        return False
+
+
 def make_assistant_turn_handler(
-    tap: ReplyTap, context: LLMContext, on_turn: Callable[[str, str], None] | None
+    tap: ReplyTap, context: LLMContext, on_turn: Callable[[str, str], None] | None,
+    tools: "toolset.ToolSession | None" = None, queue=None,
 ):
     async def _on_assistant_turn_stopped(aggregator, message):
         content = reply_content(tap, context, message)
         tap.full = ""  # consumed: never let a later turn without an LLM reply reuse it
         if on_turn is not None and content and content.strip():
             on_turn("assistant", content)
+        if tools is not None and queue is not None:
+            await false_card_backstop(tools, content, queue)
 
     return _on_assistant_turn_stopped
 
@@ -152,15 +181,23 @@ def build_worker(
     )
 
     reply_tap = ReplyTap()
+    holder: dict = {}   # the worker exists only after the pipeline is built
+
+    async def _queue(frame):
+        await holder["worker"].queue_frame(frame)
+
     assistant_agg.event_handler("on_assistant_turn_stopped")(
-        make_assistant_turn_handler(reply_tap, context, on_turn)
+        make_assistant_turn_handler(reply_tap, context, on_turn, tools, _queue)
     )
 
     if tools is not None:
+        tools.context = context
 
         @user_agg.event_handler("on_user_turn_started")
         async def _on_user_turn_started(aggregator, strategy):
             tools.reset_turn()
+            if tools.shown_id is None:
+                toolset.retire_cards(context)   # no live card: scrub stale 'on screen' traces
 
     if on_turn is not None:
 
@@ -183,4 +220,5 @@ def build_worker(
         rtvi_observer_params=RTVIObserverParams(skip_aggregator_types=["cue"]),
         app_resources=tools,
     )
+    holder["worker"] = worker
     return worker, context

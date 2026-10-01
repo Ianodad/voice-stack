@@ -32,7 +32,15 @@ from voice_stack.actions import ActionError, PendingActions
 from voice_stack.bot import build_worker
 from voice_stack.history import History
 from voice_stack.runtime import Runtime
-from voice_stack.toolset import ToolSession
+from voice_stack.toolset import (
+    SPEAK_DENIED,
+    SPEAK_DONE,
+    SPEAK_DONE_DEFAULT,
+    SPEAK_EXPIRED,
+    SPEAK_FAILED,
+    ToolSession,
+    retire_cards,
+)
 
 CANCEL_TIMEOUT = 10.0
 PUSH_TIMEOUT = 2.0
@@ -296,8 +304,8 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
                  409: "that request expired or was already used", 429: "busy"}
     # Spoken lines go into the model's context as its own words: FIXED text only,
     # never file names or any model/user/tool text.
-    _SPEAK_DONE = {"move": "Done. I moved the file.", "edit": "Done. I saved the edit."}
-    _SPEAK_FAILED = "That did not work. Nothing was changed."
+    _SPEAK_DONE = SPEAK_DONE
+    _SPEAK_FAILED = SPEAK_FAILED
 
     def _error(e: ActionError) -> JSONResponse:
         if e.status == 422:
@@ -313,6 +321,8 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
         ts = live.tool_session
         if ts is not None and ts.shown_id == action_id:
             ts.shown_id = None
+        if ts is not None and ts.shown_id is None:
+            retire_cards(ts.context)   # no card left: scrub its stale 'on screen' traces
 
     @app.get("/api/actions/pending")
     async def pending_actions():
@@ -327,7 +337,8 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
             return
         if e.reason == "expired":
             _clear_shown(live, action_id)
-            await sessions.push(live, {"type": "action_result", "id": action_id, "status": "expired"})
+            await sessions.push(live, {"type": "action_result", "id": action_id, "status": "expired"},
+                                speak=SPEAK_EXPIRED)
             await sessions.push(live, {"type": "actions_cleared"})
         elif e.reason == "failed":
             _clear_shown(live, action_id)
@@ -357,7 +368,7 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
             await sessions.push(
                 live,
                 {"type": "action_result", "id": action_id, "status": "done", "summary": summary},
-                speak=_SPEAK_DONE.get(result.get("kind", ""), "Done."),
+                speak=_SPEAK_DONE.get(result.get("kind", ""), SPEAK_DONE_DEFAULT),
             )
         return {"status": "done", "id": action_id, "summary": summary}
 
@@ -376,7 +387,7 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
             _clear_shown(live, action_id)
             await sessions.push(
                 live, {"type": "action_result", "id": action_id, "status": "denied"},
-                speak="Okay, I won't.",
+                speak=SPEAK_DENIED,
             )
         return {"status": "denied", "id": action_id}
 
