@@ -40,14 +40,17 @@ ENABLE_THINKING_EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}
 # Spoken replies must never contain code: the UI shows the fenced block in a
 # code box (the TTS skips it) and only the plain-English explanation is spoken.
 CODE_RULES = (
-    "CODE RULE: only when the user explicitly asks for code, a command, script, config, "
-    "SQL query or regex, even a one-liner, put it in a fenced block with a language tag "
-    "(for example ```bash), never inline. Always begin with ONE short spoken lead-in "
-    "sentence BEFORE the fenced block (never start with the block), then a plain-English "
-    "explanation in short sentences: 4-8 for big code, 1-2 for a one-liner. No symbols "
-    "read out, never repeat the code in the explanation. Code is shown on screen, not "
-    "spoken. For every other question, including advice, math, and explaining a concept "
-    "in words, never write code or fences, and keep the answer to 1-3 short sentences."
+    "CODE RULE: code means program text the user would paste into an editor or terminal: "
+    "a script, function, command, config, SQL query or regex. Only when the user asks for "
+    "that, including any 'what command/git command/regex...' question, put it in a "
+    "fenced block with a language tag (for example ```bash), never inline. Begin with ONE short spoken lead-in sentence BEFORE the block (never start "
+    "with the block), then explain in plain English: 4-8 short sentences for big code, "
+    "1-2 for a one-liner. Never read symbols aloud or repeat the code in the explanation. "
+    "Everything else is answered as plain spoken sentences in 1-3 short sentences, with "
+    "no fences: maths, arithmetic, numbers, units, definitions, facts, advice, jokes, "
+    "spelling. An expression like 2+2 is NEVER code. Not code: 'What is two plus two?' "
+    "-> 'Two plus two equals four.' Code: 'Show me a bash command to list files' -> "
+    "'This lists every file.' then a ```bash block, then 'It shows names, one per line.'"
 )
 SYSTEM_PROMPT = (
     "You are a concise voice assistant running entirely locally on the user's Mac "
