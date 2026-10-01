@@ -41,7 +41,7 @@ import voice_stack.server as srv
 from voice_stack import toolset
 from voice_stack.actions import PendingActions
 from voice_stack.history import History
-from voice_stack.runtime import SPIKE_AUDIO_PATH, Runtime
+from voice_stack.runtime import Runtime
 from voice_stack.server import create_app
 
 
@@ -206,7 +206,7 @@ async def unit_sweep() -> None:
         l1 = L()
         r = await propose("notes/a.txt", "archive/a.txt", l1)
         assert r.get("status") == "awaiting_user_confirmation", r
-        assert [m["type"] for m in msgs(l1.frames)] == ["pending_action"], msgs(l1.frames)
+        assert [m["type"] for m in msgs(l1.frames)] == ["tool_activity", "pending_action", "tool_activity"], msgs(l1.frames)
         # card still live: second proposal is refused (429) and does NOT push actions_cleared
         l2 = L()
         r = await propose("notes/b.txt", "archive/b.txt", l2)
@@ -216,7 +216,7 @@ async def unit_sweep() -> None:
         l3 = L()
         r = await propose("notes/b.txt", "archive/b.txt", l3)
         assert r.get("status") == "awaiting_user_confirmation", r
-        order = [m["type"] for m in msgs(l3.frames)]
+        order = [m["type"] for m in msgs(l3.frames) if m["type"] != "tool_activity"]
         assert order == ["actions_cleared", "pending_action"], order
         # a fresh first-ever card (nothing shown before) gets no actions_cleared
         session2 = toolset.ToolSession("S-fresh", root, pend)
@@ -229,7 +229,7 @@ async def unit_sweep() -> None:
             function_name="move_file", tool_call_id="1", arguments={"src": "notes/c.txt", "dst": "archive/c.txt"},
             llm=l4, pipeline_worker=None, context=SimpleNamespace(messages=[]),
             result_callback=cb2, app_resources=session2))
-        assert [m["type"] for m in msgs(l4.frames)] == ["pending_action"], msgs(l4.frames)
+        assert [m["type"] for m in msgs(l4.frames)] == ["tool_activity", "pending_action", "tool_activity"], msgs(l4.frames)
 
         # I1: card A resolved (server clears shown_id only when it equals A) while card B shows;
         # B later expires and C sweeps it -> actions_cleared must still precede C's card.
@@ -252,7 +252,7 @@ async def unit_sweep() -> None:
         a_id = s3.shown_id; assert a_id
         now2[0] = 301.0                                  # A expires unseen
         lb = L(); await prop3("notes/e.txt", "archive/e.txt", lb)
-        assert [m["type"] for m in msgs(lb.frames)] == ["actions_cleared", "pending_action"]
+        assert [m["type"] for m in msgs(lb.frames) if m["type"] != "tool_activity"] == ["actions_cleared", "pending_action"]
         b_id = s3.shown_id; assert b_id and b_id != a_id
         # late resolution of A must not clear B's marker (what the server does: only if equal)
         if s3.shown_id == a_id:
@@ -261,7 +261,7 @@ async def unit_sweep() -> None:
         now2[0] = 700.0                                  # B expires
         lc = L(); r = await prop3("notes/f.txt", "archive/f.txt", lc)
         assert r.get("status") == "awaiting_user_confirmation", r
-        assert [m["type"] for m in msgs(lc.frames)] == ["actions_cleared", "pending_action"], msgs(lc.frames)
+        assert [m["type"] for m in msgs(lc.frames) if m["type"] != "tool_activity"] == ["actions_cleared", "pending_action"], msgs(lc.frames)
     print("expired-card sweep pushes actions_cleared before the new card: ok")
 
 
@@ -455,7 +455,6 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
     assert r.status_code == 200, (r.status_code, r.text)
     res = msgs(frames, "action_result")[-1]
     assert res["summary"] == card["summary"] == r.json()["summary"], "action_result summary differs from the card"
-    import re as _re
     assert len(res["summary"]) > 300 and res["summary"].endswith("w.txt"), "summary was cut"
     print("actions: action_result summary identical to card summary (long, escape-heavy): ok")
 
@@ -555,7 +554,26 @@ async def fresh_root_mode(rt) -> None:
         app4 = create_app(rt, History(Path(d) / "h4.db"), None, root=link)
         async with app4.router.lifespan_context(app4):
             assert _stat.S_IMODE(target.stat().st_mode) == 0o755, f"symlink target chmod'ed: {oct(target.stat().st_mode)}"
-    print("sandbox root: fresh 0700, existing own dir 0700, symlink target untouched: ok")
+        # M9: a regular file or a dangling symlink at the root path fails fast and readably
+        afile = Path(d) / "afile"; afile.write_text("x")
+        dangling = Path(d) / "dangling"; dangling.symlink_to(Path(d) / "nowhere")
+        for bad in (afile, dangling):
+            try:
+                srv._secure_root(bad)
+            except RuntimeError as e:
+                assert str(e) == f"{bad} exists but is not a directory", e
+            else:
+                raise AssertionError(f"{bad}: no RuntimeError")
+        assert afile.read_text() == "x" and dangling.is_symlink() and not (Path(d) / "nowhere").exists()
+        # chmod of an existing dir's mode is logged
+        logged = []
+        sink = srv.logger.add(lambda m: logged.append(str(m)), level="INFO")
+        try:
+            existing.chmod(0o755); srv._secure_root(existing)
+        finally:
+            srv.logger.remove(sink)
+        assert any("755 -> 700" in m for m in logged), logged
+    print("sandbox root: fresh 0700, existing own dir 0700, symlink target untouched, bad root fails fast: ok")
 
 
 async def main() -> None:

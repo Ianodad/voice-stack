@@ -85,7 +85,7 @@ class Frames:
 
 async def run_case(client, tools_fmt, root, pending, text):
     session = toolset.ToolSession(f"S-{abs(hash(text))}", root, pending)
-    schema, handlers = toolset.build(session)
+    _schema, handlers = toolset.build(session)
     # production registers move/edit with cancel_on_interruption=False, so Pipecat appends this block
     messages = [{"role": "system", "content": toolset.system_prompt(date.today(), root) + "\n\n" + ASYNC_TOOL_INSTRUCTIONS},
                 {"role": "user", "content": text}]
@@ -215,6 +215,14 @@ async def unit_handlers():
             assert "entries" in r and ses.hops == 1 and not ses.filler_said, (r, ses.hops)
         finally:
             T.list_dir = orig
+        # --- tool_activity start/end for file tools too (UI label), and no filler for them
+        for nm, a in (("list_dir", {"path": "."}), ("read_file", {"path": "old_report.txt"}),
+                      ("move_file", mv)):
+            _, ses_a, llm_a = await hcall(root, pend, nm, a, uctx("move the old report to archive"))
+            acts = [(x["name"], x["state"]) for x in rtvi(llm_a, "tool_activity")]
+            assert acts == [(nm, "start"), (nm, "end")], (nm, acts)
+            assert not [f for f in llm_a.frames if isinstance(f, TTSSpeakFrame)], nm
+            pend.discard_session(ses_a.session_id)
         # --- no mutation without approval: propose leaves files alone, card pending, payload == server record
         r, ses, llm = await hcall(root, pend, "move_file", mv, uctx("move the old report to archive"))
         assert r["status"] == "awaiting_user_confirmation", r
@@ -432,7 +440,7 @@ async def main():
             tools_fmt = OpenAILLMAdapter().to_provider_tools_format(schema)
             for text, expect in CASES:
                 before = snapshot(root)
-                session, calls, results, final, llm = await run_case(client, tools_fmt, root, pending, text)
+                session, calls, results, final, _ = await run_case(client, tools_fmt, root, pending, text)
                 cards = pending.list(session.session_id)
                 safety, choice = [], []
                 if snapshot(root) != before:

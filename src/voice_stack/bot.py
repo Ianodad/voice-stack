@@ -1,5 +1,6 @@
 """Pipeline factory: builds one per-session PipelineWorker from a Runtime."""
 
+from collections import Counter
 from collections.abc import Callable
 from datetime import date
 
@@ -17,6 +18,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.turns.user_mute import AlwaysUserMuteStrategy
 
 from voice_stack import toolset
+from voice_stack.fence import CUES, LOCAL_CODE_CUE, print_code_block
 from voice_stack.runtime import (
     STT_MODEL_ID,
     TTS_LANG_CODE,
@@ -45,6 +47,17 @@ class ReplyTap(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+def _derived_from(spoken: str, full: str) -> bool:
+    """True when the turn's stored text is plausibly made from `full`. The context
+    message holds the code out of order plus the spoken cue, so compare words, not
+    order: with the cues removed, every word must be available in the full reply
+    (multiset), and something must remain."""
+    for cue in CUES:
+        spoken = spoken.replace(cue, " ")
+    words = Counter(spoken.split())
+    return bool(words) and not (words - Counter(full.split()))
+
+
 def reply_content(tap: ReplyTap, context: LLMContext, message) -> str:
     """Content to store for a finished assistant turn. When the reply had a
     code fence and was not interrupted, the aggregator context holds the code
@@ -53,6 +66,8 @@ def reply_content(tap: ReplyTap, context: LLMContext, message) -> str:
     if "```" not in tap.full or message.interrupted:
         return message.content
     full = tap.full.strip()
+    if not _derived_from(message.content or "", full):
+        return message.content  # stale tap (e.g. a fixed TTSSpeakFrame turn): no rewrite
     # Match the message holding THIS turn's spoken text. With tool calls the
     # last assistant message can be a tool_calls message; never touch those.
     spoken = (message.content or "").strip()
@@ -73,6 +88,7 @@ def make_assistant_turn_handler(
 ):
     async def _on_assistant_turn_stopped(aggregator, message):
         content = reply_content(tap, context, message)
+        tap.full = ""  # consumed: never let a later turn without an LLM reply reuse it
         if on_turn is not None and content and content.strip():
             on_turn("assistant", content)
 
@@ -87,9 +103,11 @@ def build_worker(
     mute_while_bot_speaks: bool,
     on_turn: Callable[[str, str], None] | None = None,
     tools: "toolset.ToolSession | None" = None,
+    terminal_code: bool = False,
 ) -> tuple[PipelineWorker, LLMContext]:
     """Build a fresh STT/TTS/LLM pipeline around `transport`, reusing the
     runtime's preloaded models. `messages` is prior {role, content} history.
+    `terminal_code`: no browser UI, so print code blocks to stdout and say so in the cue.
     `on_turn(role, content)` fires for each non-empty finished user/assistant
     turn (interrupted assistant turns carry only the text actually spoken).
     """
@@ -102,6 +120,7 @@ def build_worker(
         voice=TTS_VOICE,
         lang_code=TTS_LANG_CODE,
         model=runtime.tts_model,
+        **({"code_cue": LOCAL_CODE_CUE, "on_code": print_code_block} if terminal_code else {}),
     )
     if tools is None:
         llm = runtime.make_llm()

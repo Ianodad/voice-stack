@@ -329,8 +329,8 @@ def build(session: ToolSession) -> tuple[ToolsSchema, dict[str, Callable]]:
                             await params.llm.push_frame(TTSSpeakFrame(FILLER, append_to_context=False))
                         except Exception:
                             log.exception("filler push failed")
-                    started = True
-                    await _push(params, {"type": "tool_activity", "name": name, "state": "start"})
+                started = True
+                await _push(params, {"type": "tool_activity", "name": name, "state": "start"})
                 try:
                     result = await _run(params)
                 except ToolError as e:

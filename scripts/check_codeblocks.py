@@ -19,6 +19,7 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    TTSSpeakFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -30,7 +31,7 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.workers.runner import WorkerRunner
 
 from voice_stack.bot import ReplyTap, make_assistant_turn_handler
-from voice_stack.fence import CODE_CUE, FenceAggregator
+from voice_stack.fence import CODE_CUE, LOCAL_CODE_CUE, FenceAggregator, print_code_block
 from voice_stack.runtime import CODE_RULES, SYSTEM_PROMPT
 from voice_stack.tts import MLXKokoroTTSService
 
@@ -63,8 +64,8 @@ class FakeOut(BaseOutputTransport):
 INTERRUPT = object()  # in a parts list: interrupt the bot, then a new reply starts
 
 
-async def run(parts):
-    tts = MLXKokoroTTSService(executor=ThreadPoolExecutor(max_workers=1), model=FakeModel())
+async def run(parts, **tts_kw):
+    tts = MLXKokoroTTSService(executor=ThreadPoolExecutor(max_workers=1), model=FakeModel(), **tts_kw)
     spoken = []
     orig = tts.run_tts
 
@@ -99,9 +100,15 @@ async def run(parts):
                 await asyncio.sleep(0.4)
                 await worker.queue_frames([InterruptionFrame(), LLMFullResponseStartFrame()])
                 await asyncio.sleep(0.2)
+            elif isinstance(p, tuple):
+                pass  # ("speak", text): sent after the LLM reply ends, see below
             else:
                 await worker.queue_frames([LLMTextFrame(p)])
         await worker.queue_frames([LLMFullResponseEndFrame()])
+        for p in parts:
+            if isinstance(p, tuple):  # fixed line, no LLM response around it
+                await asyncio.sleep(1.0)
+                await worker.queue_frames([TTSSpeakFrame(p[1], append_to_context=True)])
         await asyncio.sleep(1.5)
         await worker.queue_frames([EndFrame()])
 
@@ -336,6 +343,48 @@ async def main():
     reply_content(tap, ctx2, SimpleNamespace(content="something else", interrupted=False))
     assert ctx2.messages[1] == tc, ctx2.messages
     print("tool-call context ok")
+
+    # 4. I1: stale tap + fixed TTSSpeakFrame turn (no LLM response). The code reply
+    # must not replace or duplicate the later 'Done.' turn in context or history.
+    code_reply = "Here:\n```python\nprint(1)\n```\nThat prints one."
+    done = "Done. I saved the edit."
+    spoken, outputs, ctx, turns = await run([code_reply, ("speak", done)])
+    assert [r for r, _ in turns] == ["assistant", "assistant"], turns
+    assert turns[0][1] == code_reply and turns[1][1] == done, turns
+    contents = [m["content"] for m in ctx.messages]
+    assert contents == [code_reply, done], contents
+    assert sum("print(1)" in c for c in contents) == 1 and sum("print(1)" in t for _, t in turns) == 1
+    tap = ReplyTap(); tap.full = code_reply
+    from types import SimpleNamespace as NS
+    ctx3 = LLMContext(messages=[{"role": "assistant", "content": done}])
+    assert reply_content(tap, ctx3, NS(content=done, interrupted=False)) == done
+    assert ctx3.messages[0]["content"] == done
+    print("stale tap ok")
+
+    # 5. I3: terminal mode prints the code block once, never speaks it, and uses the
+    # terminal cue; web mode (default) keeps the screen cue and prints nothing.
+    import contextlib, io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        spoken, outputs, ctx, turns = await run(
+            ["Try this.\n```bash\nls -la\n```\nIt lists files."],
+            code_cue=LOCAL_CODE_CUE, on_code=print_code_block)
+    out = buf.getvalue()
+    assert out.count("ls -la") == 1 and out.count("-" * 40) == 2 and "code (bash)" in out, out
+    assert "```" not in out, out
+    assert spoken == ["Try this.", LOCAL_CODE_CUE, "It lists files."], spoken
+    assert not any("ls -la" in x for x in spoken) and CODE_CUE not in spoken, spoken
+    assert LOCAL_CODE_CUE == "I've printed the code in the terminal."
+    # unterminated block still printed once
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        await run(["Look.\n```python\nprint(2)"], code_cue=LOCAL_CODE_CUE, on_code=print_code_block)
+    assert buf.getvalue().count("print(2)") == 1, buf.getvalue()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        spoken, *_ = await run(["Try this.\n```bash\nls -la\n```\nIt lists files."])
+    assert buf.getvalue() == "" and spoken[1] == CODE_CUE, (buf.getvalue(), spoken)
+    print("terminal mode ok")
     print("PASS")
 
 

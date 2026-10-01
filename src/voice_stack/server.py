@@ -218,13 +218,21 @@ def _secure_root(root: Path) -> None:
     real (non-symlink) directory owned by this user; never follow a symlink."""
     if root.is_symlink():
         logger.warning("sandbox root {} is a symlink; leaving its permissions alone", root)
-        root.mkdir(parents=True, exist_ok=True)       # no-op if the target exists
+        if not root.is_dir():  # dangling link, or link to a file
+            raise RuntimeError(f"{root} exists but is not a directory")
         return
+    if os.path.lexists(root) and not root.is_dir():
+        raise RuntimeError(f"{root} exists but is not a directory")
     created = not root.exists()
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except FileExistsError:
+        raise RuntimeError(f"{root} exists but is not a directory") from None
     try:
         st = os.lstat(root)
         if created or (stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid()):
+            if not created and stat.S_IMODE(st.st_mode) != 0o700:
+                logger.info("sandbox root {}: mode {:o} -> 700", root, stat.S_IMODE(st.st_mode))
             os.chmod(root, 0o700)
         else:
             logger.warning("sandbox root {} is not a directory owned by this user; permissions unchanged", root)

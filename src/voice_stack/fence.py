@@ -25,11 +25,27 @@ from pipecat.utils.text.pattern_pair_aggregator import PatternMatch
 from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
 
 CODE_CUE = "I've put the code on screen."
+LOCAL_CODE_CUE = "I've printed the code in the terminal."
+CUES = (CODE_CUE, LOCAL_CODE_CUE)
 _FENCE_CHARS = "`~"
 _INFO_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+#-_./"
 )
 _INFO_MAX = 20
+
+
+def print_code_block(raw: str) -> None:
+    """Terminal display for a raw fence: delimited, language label, the code."""
+    lines = raw.split("\n")
+    first = lines[0].lstrip(_FENCE_CHARS)
+    lang = first.strip()
+    body = lines[1:]
+    if body and body[-1].strip() and set(body[-1].strip()) <= set(_FENCE_CHARS):
+        body = body[:-1]
+    elif not lines[1:]:  # single line: ```code``` with no newline
+        body = []
+    bar = "-" * 40
+    print(f"\n{bar}\ncode ({lang or 'text'})\n" + "\n".join(body) + f"\n{bar}", flush=True)
 
 
 class FenceAggregator(SimpleTextAggregator):
@@ -38,9 +54,10 @@ class FenceAggregator(SimpleTextAggregator):
     (even char by char). An unterminated fence at flush is still yielded as
     code. Everything resets on interruption."""
 
-    def __init__(self, cue: str | None = None, **kw):
+    def __init__(self, cue: str | None = None, on_code=None, **kw):
         super().__init__(**kw)
         self._cue = cue
+        self._on_code = on_code  # called with the raw fence of each finished code block
         self._reset_fence_state()
 
     def _reset_fence_state(self):
@@ -108,6 +125,11 @@ class FenceAggregator(SimpleTextAggregator):
     def _finish(self, closer: str) -> PatternMatch:
         raw = f"{self._open}{self._code}{closer}"
         self._reset_fence_state()
+        if self._on_code is not None:
+            try:
+                self._on_code(raw)
+            except Exception:
+                pass  # a display hook must never break speech
         return PatternMatch(content=raw, type="code", full_match=raw)
 
     async def _code_char(self, ch: str):

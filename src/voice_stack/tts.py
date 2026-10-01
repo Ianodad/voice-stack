@@ -40,6 +40,8 @@ class MLXKokoroTTSService(TTSService):
         lang_code: str = "a",
         speed: float = 1.0,
         model=None,
+        code_cue: str | None = CODE_CUE,
+        on_code=None,
         **kwargs,
     ):
         # language=None: multi-language switching goes through lang_code
@@ -59,7 +61,7 @@ class MLXKokoroTTSService(TTSService):
         # Same pattern as pipecat's Cartesia/Rime services: swap the base
         # SimpleTextAggregator after init.
         self._text_aggregator = FenceAggregator(
-            cue=CODE_CUE, aggregation_type=self._text_aggregation_mode
+            cue=code_cue, on_code=on_code, aggregation_type=self._text_aggregation_mode
         )
         self._executor = executor
         self._voice = voice

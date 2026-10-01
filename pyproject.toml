@@ -1,7 +1,7 @@
 [project]
 name = "voice-stack"
 version = "0.1.0"
-description = "Add your description here"
+description = "Fully local voice assistant for Apple Silicon: parakeet-mlx, Qwen via mlx-lm, Kokoro, Pipecat, with a browser UI"
 readme = "README.md"
 authors = [
     { name = "Ian Adera", email = "ianodad@gmail.com" }

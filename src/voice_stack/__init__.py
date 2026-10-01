@@ -66,7 +66,9 @@ async def async_main(check: bool, barge_in: bool) -> None:
         transport = LocalAudioTransport(
             LocalAudioTransportParams(audio_in_enabled=True, audio_out_enabled=True)
         )
-        worker, _ = build_worker(transport, rt, [], mute_while_bot_speaks=not barge_in)
+        worker, _ = build_worker(
+            transport, rt, [], mute_while_bot_speaks=not barge_in, terminal_code=True
+        )
 
         mode = "barge-in enabled, use headphones" if barge_in else "mic muted while bot speaks"
         print(f"Ready ({mode}) — speak")
@@ -87,6 +89,10 @@ async def web_main(port: int) -> None:
     from voice_stack.history import History
     from voice_stack.server import create_app
 
+    from voice_stack import tools as _tools
+    from voice_stack.server import _secure_root
+
+    _secure_root(_tools.DEFAULT_ROOT)  # fail fast, before the models load
     rt = Runtime()
     try:
         await rt.start()

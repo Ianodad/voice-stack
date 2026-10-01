@@ -365,7 +365,7 @@ assert inner("") == ""
 print("check_web_tools.py: PASS")
 
 # ======================= fix round 1 =======================
-import random, re as _re2
+import re as _re2
 
 
 async def lag_during(coro):
@@ -432,7 +432,6 @@ async def main2():
                 "uu", "bz2", "quopri", "string_escape", "latin-1", "utf_32", "koi8-r", "\u0000"]
     lat = b"<html><title>Caf\xe9</title><body><p>" + b"na\xefve text. " * 50
     bodies = [PAGE, b"",b"\xff\xfe\x00\x00garbage", bytes(range(256)) * 50, b"\x00" * 1000, lat]
-    rnd = random.Random(7)
     for cs in charsets:
         for ct in ("text/html; charset=" + cs, "text/plain;charset=" + cs, 'text/html; charset="' + cs + '"'):
             for body in bodies:

@@ -315,7 +315,6 @@ with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outsid
     # Known accepted limitation: Cf (ZWJ/ZWNJ) rejected in paths and edit text
     raises(T.plan_edit, root, "s1.txt", "hello", "a\u200db")
     # ---- follow-up: injective display (backslash, tab, marks, default-ignorables) ----
-    import re as _re
     def decode_display(x):
         out, i = [], 0
         while i < len(x):
@@ -347,7 +346,7 @@ with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as outsid
     assert z.count("\u0301") == 2 and z.count("\\u0301") == 198, z[:40]     # first 2 kept, rest escaped
     assert T._display("a\r", crlf=True) == "a" and T._display("a\r") == "a\\u000d"
     # randomized injectivity over a nasty alphabet
-    import random, itertools
+    import random
     rnd = random.Random(7)
     alpha = ["a", " ", "\\", "t", "u", "0", "\t", "\u202e", "\u0301", "\u00a0", "\U000f0000", "\ufe0f", "\r", "/", "2"]
     seen = {}
