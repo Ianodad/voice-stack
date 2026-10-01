@@ -2,14 +2,14 @@
 
 # voice-stack
 
-**A voice assistant that runs entirely on your Mac.**<br>
-Talk to a local AI and hear it talk back. No cloud, no subscription, nobody else listening.
+**A voice assistant that runs on your Mac.**<br>
+Talk to a local AI and hear it talk back. Your voice, the model and your chats stay on your machine: no cloud, no subscription, nobody else listening. Only the optional web tools reach the internet.
 
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-required-111?logo=apple&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![Pipecat](https://img.shields.io/badge/Pipecat-1.12-6f42c1)
 ![License](https://img.shields.io/badge/license-MIT-2ea44f)
-![Local first](https://img.shields.io/badge/runs-100%25%20local-ff6b4a)
+![Local first](https://img.shields.io/badge/local--first-voice%20stays%20on%20your%20Mac-ff6b4a)
 
 <img src="docs/images/voice-web-ui.png" alt="The web UI: a glowing multi-colour star that shows what the assistant is doing, a live transcript, and mute and disconnect buttons" width="620">
 
@@ -19,13 +19,13 @@ Talk to a local AI and hear it talk back. No cloud, no subscription, nobody else
 
 ## What you get
 
-- **Spoken conversation, fully offline.** Speech in, speech out. Once the models are downloaded, nothing leaves your machine.
+- **Spoken conversation, local.** Speech in, speech out. Once the models are downloaded, your audio, transcripts and history never leave your machine. (Only the optional web search and page tools send anything out; see [Privacy](#privacy).)
 - **Fast.** About **0.73 s** from the end of your sentence to the first sound of the reply, with everything warmed up (measured, see [Performance](#performance)).
 - **Interrupt it any time.** Cut in mid-sentence and it stops. In the browser this works on laptop speakers because the browser cancels the echo.
 - **A browser UI with a living star.** About 80 rays, each its own colour, that react to what the assistant is doing: listening, thinking, speaking, muted, error.
 - **Saved conversations.** Reopen a chat and continue it; the model sees the last 20 messages.
-- **Code on screen, not in your ears.** Ask for a script and it appears in a code box with a **Copy** button. The assistant speaks only a short explanation in plain English.
-- **Assistant tools (experimental).** Web search, page reading, and a sandboxed folder where it can list, read, find, move and edit files, with every change gated by a confirmation card. See [Assistant tools](#assistant-tools).
+- **Code on screen, not in your ears (browser UI).** Ask for a script and it appears in a code box with a **Copy** button. The assistant speaks only a short explanation in plain English.
+- **Assistant tools (experimental, browser UI only).** Web search, page reading, and a sandboxed folder where it can list, read, find, move and edit files, with every change gated by a confirmation card. See [Assistant tools](#assistant-tools).
 
 ![Seven states of the star orb: connecting, listening, user speaking, thinking, speaking, muted, error](docs/images/voice-star-states.png)
 
@@ -118,11 +118,13 @@ uv run voice-stack
 
 > **Status: experimental.** The tools are built and have been through adversarial security review, but they have not yet had a full live acceptance run on real files. Treat them as a preview.
 
-The assistant works inside **one folder only: `~/VoiceAssistant`** (created on first start). Everything else on your Mac is out of reach.
+Tools are available in the browser UI (`voice-stack web`) only; the terminal modes have no tools and no code box (code is not spoken there either, so ask for code in the browser).
+
+The assistant works inside **one folder only: `~/VoiceAssistant`** (created on first start with private permissions). Everything else on your Mac is out of reach.
 
 | Tool | What it does | Needs your click? |
 |---|---|---|
-| `web_search` | Searches the web (DuckDuckGo via `ddgs`, no API key) | No |
+| `web_search` | Searches the web (the `ddgs` metasearch library: several public engines such as Wikipedia, Bing, Brave, Google and Yandex; no API key) | No |
 | `fetch_page` | Reads a page as plain text (only URLs that came from a search or from you) | No |
 | `list_dir`, `find_file`, `file_info` | Look around the folder (fuzzy file names, so "my shopping list" works) | No |
 | `read_file` | Reads a text file (capped at 16 KB per call for voice use) | No |
@@ -132,7 +134,7 @@ The assistant works inside **one folder only: `~/VoiceAssistant`** (created on f
 
 ### The safety model
 
-Voice assistants make mistakes ("move the *whore*…" is a real mishearing the tests use) and web pages can contain hidden instructions. So the design assumes the model can be fooled and puts the gate **outside** the model:
+Voice assistants mishear things (short words are the weak spot) and web pages can contain hidden instructions. So the design assumes the model can be fooled and puts the gate **outside** the model:
 
 1. **The model can only propose.** Moves and edits create a *pending action* on the server. Nothing runs until you click **Approve** in the browser. The model has no tool that approves, and saying "yes" out loud does not count.
 2. **The card shows the truth.** The confirmation card is built from the server's validated arguments, not from what the model says. Edits show a real diff. Hidden and look-alike characters (right-to-left overrides, zero-width characters, odd spaces) are shown as visible escape chips, so a card can't hide what it approves.
@@ -142,7 +144,7 @@ Voice assistants make mistakes ("move the *whore*…" is a real mishearing the t
 6. **Untrusted content is labelled.** Web text and file text are wrapped as untrusted data, and the assistant is told to ignore instructions inside them.
 7. **A careful web fetcher.** It refuses `localhost`, private networks and cloud-metadata addresses, connects only to an address it already vetted, caps the size of what it reads, and runs page extraction with strict time limits.
 
-The audit log stores a short part of each edit's diff, so fragments of file text can end up in `.audit.jsonl`, and the log is never rotated. Delete it yourself if that matters to you.
+**Known limits:** lines that contain invisible or control characters (for example zero-width joiners in some emoji and Persian or Indic text) can't be edited by voice, and the assistant says so. Text the assistant reads from web pages or files can be repeated back in its replies, which are saved in your history like any other reply. The audit log stores a short part of each edit's diff, so fragments of file text can end up in `.audit.jsonl`, and the log is never rotated. Delete it yourself if that matters to you.
 
 ## Performance
 
@@ -202,7 +204,7 @@ Design docs live in [`docs/superpowers/specs`](docs/superpowers/specs) and [`doc
 
 ## Privacy
 
-After the models download, audio, transcripts and history stay on your machine. The only traffic that leaves it is what the web tools send when you ask for a search or a page (the query or URL goes to DuckDuckGo or the site). The server listens on `127.0.0.1` only and checks the `Host` and `Origin` headers on every request.
+After the models download, audio, transcripts and history stay on your machine. The only traffic that leaves it is what the web tools send when you ask for a search or a page: the search query goes to the public search engines that `ddgs` uses, and page requests go to the site you are reading. Queries are not filtered beyond the assistant's instructions never to put file contents or personal data in them, so don't ask it to search for secrets. The server listens on `127.0.0.1` only and checks the `Host` and `Origin` headers on every request.
 
 ## License
 
