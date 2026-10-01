@@ -160,6 +160,26 @@ with tempfile.TemporaryDirectory() as d:
     root = Path(d).resolve(); (root/"a.txt").write_text("a"); clk = Clock(); pa = PendingActions(root, clock=clk)
     pa.propose("W", "move", {"src": "a.txt", "dst": "b.txt"})
     t0 = json.loads((root/".audit.jsonl").read_text().splitlines()[0])["t"]; assert abs(t0 - time.time()) < 60
+# (M2) machine-readable ActionError.reason
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d).resolve(); (root/"a.txt").write_text("a"); (root/"archive").mkdir()
+    clk = Clock(); pa = PendingActions(root, clock=clk)
+    def reason(fn, *a):
+        try: fn(*a)
+        except ActionError as e: return e.reason
+        raise AssertionError("no ActionError")
+    p = pa.propose("R1", "move", {"src": "a.txt", "dst": "archive/a.txt"})
+    assert reason(pa.approve, "nope", "R1") == "unknown"
+    assert reason(pa.approve, p.id, "R2") == "wrong_session"
+    assert reason(pa.propose, "R1", "move", {"src": "a.txt", "dst": "archive/z.txt"}) == "busy"
+    pa.approve(p.id, "R1")
+    assert reason(pa.approve, p.id, "R1") == "used" and reason(pa.deny, p.id, "R1") == "used"
+    (root/"b.txt").write_text("b"); q = pa.propose("R1", "move", {"src": "b.txt", "dst": "archive/b.txt"})
+    clk.t += 301
+    assert reason(pa.approve, q.id, "R1") == "expired"
+    (root/"c.txt").write_text("c"); r = pa.propose("R1", "move", {"src": "c.txt", "dst": "archive/c.txt"})
+    (root/"c.txt").unlink()
+    assert reason(pa.approve, r.id, "R1") == "failed"
 # (M4) tools hide the audit file in every spelling
 with tempfile.TemporaryDirectory() as d:
     root = Path(d).resolve(); (root/"a.txt").write_text("a"); (root/".audit.jsonl").write_text("{}\n")

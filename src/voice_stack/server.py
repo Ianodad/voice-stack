@@ -35,7 +35,6 @@ from voice_stack.toolset import ToolSession
 
 CANCEL_TIMEOUT = 10.0
 PUSH_TIMEOUT = 2.0
-SUMMARY_SPOKEN_MAX = 80
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069]")
 
@@ -197,7 +196,7 @@ class SessionManager:
         # Pending actions die with the session, even if the worker already ended.
         await self._discard(session)
         if session.tool_session is not None:
-            session.tool_session.card_shown = False
+            session.tool_session.shown_id = None
         task = session.task
         if task is None or task.done():
             return
@@ -222,7 +221,11 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        root.mkdir(parents=True, exist_ok=True)
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            logger.warning("could not chmod sandbox root {} to 0700", root)
         try:
             yield
         finally:
@@ -248,8 +251,11 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
             return JSONResponse({"detail": "bad Origin"}, status_code=403)
         if (
             request.url.path.startswith("/api/")
-            and request.method in ("POST", "PATCH")
-            and request.headers.get("content-length", "0") != "0"
+            and request.method in ("POST", "PATCH", "PUT", "DELETE")
+            and (
+                request.url.path.startswith("/api/actions/") or request.url.path == "/api/offer"
+                or request.headers.get("content-length", "0") != "0"   # other routes: body present
+            )
             and request.headers.get("content-type", "").split(";")[0].strip().lower()
             != "application/json"
         ):
@@ -264,13 +270,25 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
     # With no live session: GET pending -> [] ; approve/deny -> 409 "no active session".
     _MESSAGES = {400: "bad request", 404: "no such pending action",
                  409: "that request expired or was already used", 429: "busy"}
+    # Spoken lines go into the model's context as its own words: FIXED text only,
+    # never file names or any model/user/tool text.
+    _SPEAK_DONE = {"move": "Done. I moved the file.", "edit": "Done. I saved the edit."}
+    _SPEAK_FAILED = "That did not work. Nothing was changed."
 
-    def _http_error(e: ActionError) -> HTTPException:
+    def _error(e: ActionError) -> JSONResponse:
         if e.status == 422:
-            return HTTPException(status_code=422, detail=_clean(e, 300) or "could not complete the action")
+            return JSONResponse({"detail": _clean(e, 300) or "could not complete the action"}, status_code=422)
         if e.status in _MESSAGES:
-            return HTTPException(status_code=e.status, detail=_MESSAGES[e.status])
-        return HTTPException(status_code=500, detail="internal error")
+            body = {"detail": _MESSAGES[e.status]}
+            if e.reason == "used":
+                body["error"] = "already handled"
+            return JSONResponse(body, status_code=e.status)
+        return JSONResponse({"detail": "internal error"}, status_code=500)
+
+    def _clear_shown(live: _Session, action_id: str) -> None:
+        ts = live.tool_session
+        if ts is not None and ts.shown_id == action_id:
+            ts.shown_id = None
 
     @app.get("/api/actions/pending")
     async def pending_actions():
@@ -279,29 +297,41 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
             return []
         return await asyncio.to_thread(pending.list, sid)
 
+    async def _on_failure(sid: str, action_id: str, e: ActionError) -> None:
+        live = sessions.live_session(sid)         # id must still match the live session
+        if live is None:
+            return
+        if e.reason == "expired":
+            _clear_shown(live, action_id)
+            await sessions.push(live, {"type": "action_result", "id": action_id, "status": "expired"})
+            await sessions.push(live, {"type": "actions_cleared"})
+        elif e.reason == "failed":
+            _clear_shown(live, action_id)
+            await sessions.push(
+                live,
+                {"type": "action_result", "id": action_id, "status": "failed",
+                 "summary": "That did not work. Nothing was changed."},
+                speak=_SPEAK_FAILED,
+            )
+
     @app.post("/api/actions/{action_id}/approve")
     async def approve_action(action_id: str):
         sid = sessions.current_session_id()     # captured at request time
         if sid is None:
-            raise HTTPException(status_code=409, detail="no active session")
+            return JSONResponse({"detail": "no active session"}, status_code=409)
         try:
             result = await asyncio.to_thread(pending.approve, action_id, sid)
         except ActionError as e:
-            live = sessions.live_session(sid)
-            if live is not None and e.status == 409 and "already used" not in str(e):
-                live.tool_session.card_shown = False
-                await sessions.push(live, {"type": "action_result", "id": action_id, "status": "expired"})
-                await sessions.push(live, {"type": "actions_cleared"})
-            raise _http_error(e)
-        summary = _clean(result.get("summary", ""), 200)
+            await _on_failure(sid, action_id, e)
+            return _error(e)
+        summary = _clean(result.get("summary", ""), 200)     # plan summary (already escaped for display)
         live = sessions.live_session(sid)
         if live is not None:
-            live.tool_session.card_shown = False
-            spoken = _clean(summary, SUMMARY_SPOKEN_MAX)
+            _clear_shown(live, action_id)
             await sessions.push(
                 live,
                 {"type": "action_result", "id": action_id, "status": "done", "summary": summary},
-                speak=f"Done. {spoken}" if spoken else "Done.",
+                speak=_SPEAK_DONE.get(result.get("kind", ""), "Done."),
             )
         return {"status": "done", "id": action_id, "summary": summary}
 
@@ -309,19 +339,15 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
     async def deny_action(action_id: str):
         sid = sessions.current_session_id()
         if sid is None:
-            raise HTTPException(status_code=409, detail="no active session")
+            return JSONResponse({"detail": "no active session"}, status_code=409)
         try:
             await asyncio.to_thread(pending.deny, action_id, sid)
         except ActionError as e:
-            live = sessions.live_session(sid)
-            if live is not None and e.status == 409 and "already used" not in str(e):
-                live.tool_session.card_shown = False
-                await sessions.push(live, {"type": "action_result", "id": action_id, "status": "expired"})
-                await sessions.push(live, {"type": "actions_cleared"})
-            raise _http_error(e)
+            await _on_failure(sid, action_id, e)
+            return _error(e)
         live = sessions.live_session(sid)
         if live is not None:
-            live.tool_session.card_shown = False
+            _clear_shown(live, action_id)
             await sessions.push(
                 live, {"type": "action_result", "id": action_id, "status": "denied"},
                 speak="Okay, I won't.",

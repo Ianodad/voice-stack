@@ -47,9 +47,12 @@ class ActionError(Exception):
     """HTTP-shaped failure: 400 bad request, 404 unknown/wrong session,
     409 expired or already used, 422 could not execute, 429 one pending at a time."""
 
-    def __init__(self, status: int, message: str = ""):
+    def __init__(self, status: int, message: str = "", reason: str = ""):
         super().__init__(message or f"action error {status}")
         self.status = status
+        # machine-readable: expired | used | unknown | wrong_session | busy | bad_request | failed
+        self.reason = reason or {400: "bad_request", 404: "unknown", 409: "used",
+                                 422: "failed", 429: "busy"}.get(status, "")
 
 
 @dataclass
@@ -138,15 +141,15 @@ class PendingActions:
                 if p is None:
                     owner = self._spent.get(action_id) if isinstance(action_id, str) else None
                     if owner is not None and owner == session_id:
-                        raise ActionError(409, "that action was already used or has expired")
+                        raise ActionError(409, "that action was already used or has expired", "used")
                     raise ActionError(404, "no such pending action")
                 if p.session_id != session_id:
-                    raise ActionError(404, "no such pending action")      # pending stays put
+                    raise ActionError(404, "no such pending action", "wrong_session")      # pending stays put
                 del self._items[action_id]
                 self._mark_spent(p)
                 if self._expired(p):
                     events.append(("expire", p, f"expired before {verb}"))
-                    raise ActionError(409, "that action expired")
+                    raise ActionError(409, "that action expired", "expired")
                 return p
         finally:
             self._flush(events)
@@ -216,7 +219,8 @@ class PendingActions:
             self._audit("execute_fail", p, f"{type(e).__name__}: {e}")
             raise ActionError(422, "the action could not be completed; nothing was changed") from e
         self._audit("execute_ok", p, json.dumps(result if isinstance(result, dict) else {}, default=str))
-        return {**(result if isinstance(result, dict) else {}), "status": "done", "summary": p.summary}
+        return {**(result if isinstance(result, dict) else {}), "status": "done", "summary": p.summary,
+                "kind": p.kind}
 
     def deny(self, action_id: str, session_id: str) -> None:
         p = self._take(action_id, session_id, "denial")
