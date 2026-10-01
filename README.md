@@ -24,7 +24,9 @@ Talk to a local AI and hear it talk back. Your voice, the model and your chats s
 - **Interrupt it any time.** Cut in mid-sentence and it stops. In the browser this works on laptop speakers because the browser cancels the echo.
 - **A browser UI with a living star.** About 80 rays, each its own colour, that react to what the assistant is doing: listening, thinking, speaking, muted, error.
 - **Saved conversations.** Reopen a chat and continue it; the model sees the last 20 messages.
-- **Code on screen, not in your ears (browser UI).** Ask for a script and it appears in a code box with a **Copy** button. The assistant speaks only a short explanation in plain English.
+- **Code on screen, not in your ears.** Ask for a script and it appears in a code box with a **Copy** button (printed to the terminal in terminal mode). The assistant speaks only a short plain-English explanation.
+
+<img src="docs/images/code-box.png" alt="A Python function shown in a code box with a language label and a Copy button, followed by a plain-English explanation" width="620">
 - **Assistant tools (experimental, browser UI only).** Web search, page reading, and a sandboxed folder where it can list, read, find, move and edit files, with every change gated by a confirmation card. See [Assistant tools](#assistant-tools).
 
 ![Seven states of the star orb: connecting, listening, user speaking, thinking, speaking, muted, error](docs/images/voice-star-states.png)
@@ -118,7 +120,7 @@ uv run voice-stack
 
 > **Status: experimental.** The tools are built and have been through adversarial security review, but they have not yet had a full live acceptance run on real files. Treat them as a preview.
 
-Tools are available in the browser UI (`voice-stack web`) only; the terminal modes have no tools and no code box (code is not spoken there either, so ask for code in the browser).
+Tools are available in the browser UI (`voice-stack web`) only. The terminal modes have no tools; there, code is printed to the terminal instead of a code box (and is never read aloud).
 
 The assistant works inside **one folder only: `~/VoiceAssistant`** (created on first start with private permissions). Everything else on your Mac is out of reach.
 
@@ -133,6 +135,8 @@ The assistant works inside **one folder only: `~/VoiceAssistant`** (created on f
 | *(no delete tool)* | Asked to delete, it says so and offers to move the file to `archive/` | n/a |
 
 ### The safety model
+
+<img src="docs/images/confirmation-card.png" alt="The confirmation card: Confirm move, 'Move e2e-test-note.txt to archive/e2e-test-note.txt', Approve (Enter) and Deny (Esc) buttons" width="620">
 
 Voice assistants mishear things (short words are the weak spot) and web pages can contain hidden instructions. So the design assumes the model can be fooled and puts the gate **outside** the model:
 
