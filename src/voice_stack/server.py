@@ -42,7 +42,8 @@ from voice_stack.toolset import (
     SPEAK_FAILED,
     ToolSession,
     refresh_shown,
-    retire_cards,
+    retire_card,
+    settle_cards,
 )
 
 CANCEL_TIMEOUT = 10.0
@@ -209,7 +210,8 @@ class SessionManager:
         await self._discard(session)
         if session.tool_session is not None:
             session.tool_session.shown_id = None
-            retire_cards(session.tool_session.context, "cleared")
+            for cid in list(session.tool_session.cards):
+                retire_card(session.tool_session, cid, "cleared")
         task = session.task
         if task is None or task.done():
             return
@@ -322,17 +324,18 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
         return JSONResponse({"detail": "internal error"}, status_code=500)
 
     def _clear_shown(live: _Session, action_id: str, outcome: str) -> bool:
-        """The card `action_id` ended with `outcome` (done/denied/expired/failed). Clear the marker
-        and, when no card is left, scrub its stale traces from the model's context with outcome-specific
-        wording. Returns True when NO other card is live (so 'no card on screen' is true)."""
+        """Card `action_id` ended with `outcome` (done/denied/expired/failed). Clear the marker and
+        scrub THAT card's traces from the model's context with outcome-specific wording; when no card
+        is left, neutralise leftover card claims too. Returns True when NO other card is live (so
+        'no card on screen' is true)."""
         ts = live.tool_session
         if ts is None:
             return True
         if ts.shown_id == action_id:
             ts.shown_id = None
-            ts.last_outcome = outcome
+        retire_card(ts, action_id, outcome)
         if ts.shown_id is None:
-            retire_cards(ts.context, outcome)
+            settle_cards(ts)
             return True
         return False
 

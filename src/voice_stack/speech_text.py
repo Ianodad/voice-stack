@@ -31,7 +31,7 @@ _BLANKS = re.compile(r"\n{2,}")
 _ONLY_MARKS = re.compile(r"^[\s\-*_#>|~`=+.:•]*$")
 
 
-_MAX_FULL = 8192   # bigger chunks get only the linear strips: lazy spans could go quadratic
+_MAX_FULL = 4096   # bigger chunks (over 4 KB) get only the linear strips: lazy spans could go quadratic
 _CHEAP_BOLD = re.compile(r"\*\*")
 
 

@@ -478,57 +478,63 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
     ts.shown_id = None
     CLAIM = "A confirmation card is on screen waiting for your approval."
 
-    def seed():
+    EVID = '{"content": "notes: {\\"status\\": \\"awaiting_user_confirmation\\"}"}'   # file text with the magic string
+
+    def seed(card_id):
+        ts.cards[card_id] = {"tool_call_id": "cd-" + card_id, "outcome": None}
         cx.add_messages([
-            {"role": "tool", "tool_call_id": "rd", "content": '{"content": "alert when load > 5"}'},
-            {"role": "tool", "tool_call_id": "cd", "content": _json.dumps({"status": "awaiting_user_confirmation"})},
+            {"role": "tool", "tool_call_id": "rd", "content": EVID},
+            {"role": "tool", "tool_call_id": "cd-" + card_id,
+             "content": _json.dumps({"status": "awaiting_user_confirmation"})},
             {"role": "assistant", "content": CLAIM}])
         return len(cx.messages) - 3
 
     def scrubbed(i, tool_word, say_word):
         m = cx.messages
-        assert m[i]["content"] == '{"content": "alert when load > 5"}', m[i]               # evidence untouched
+        assert m[i]["content"] == EVID, m[i]                                               # evidence untouched
         assert tool_word in m[i + 1]["content"] and "awaiting_user_confirmation" not in m[i + 1]["content"], m[i + 1]
         assert say_word in m[i + 2]["content"] and "card" not in m[i + 2]["content"], m[i + 2]
 
     for name in ("r1", "r2", "r3", "r4"):
         (notes / f"{name}.txt").write_text(name + "\n")
     mv = lambda n: pend.propose(sid, "move", {"src": f"notes/{n}.txt", "dst": f"archive/{n}.txt"})
-    p = mv("r1"); ts.shown_id = p.id; i = seed()
+    p = mv("r1"); ts.shown_id = p.id; i = seed(p.id)
     assert (await http.post(f"{base}/api/actions/{p.id}/approve", json={})).status_code == 200
     scrubbed(i, "WAS applied", "the user approved it")
-    assert ts.last_outcome == "done"
-    p = mv("r2"); ts.shown_id = p.id; i = seed()
+    p = mv("r2"); ts.shown_id = p.id; i = seed(p.id)
     assert (await http.post(f"{base}/api/actions/{p.id}/deny", json={})).status_code == 200
     scrubbed(i, "denied by the user", "the user denied it")
     assert _ts.SPEAK_DENIED in spoken(frames)
-    p = mv("r3"); ts.shown_id = p.id; i = seed(); (notes / "r3.txt").unlink()
+    p = mv("r3"); ts.shown_id = p.id; i = seed(p.id); (notes / "r3.txt").unlink()
     assert (await http.post(f"{base}/api/actions/{p.id}/approve", json={})).status_code == 422
     scrubbed(i, "failed", "it failed")
     # expiry via the approve route
     now = [5000.0]; real_clock = pend._clock; pend._clock = lambda: now[0]
     try:
-        p = mv("r4"); ts.shown_id = p.id; i = seed(); now[0] += 301
+        p = mv("r4"); ts.shown_id = p.id; i = seed(p.id); now[0] += 301
         assert (await http.post(f"{base}/api/actions/{p.id}/approve", json={})).status_code == 409
         scrubbed(i, "expired", "it expired")
         assert _ts.SPEAK_EXPIRED in spoken(frames)
         # a card that simply times out: GET /pending notices the dead shown_id, clears it, scrubs 'expired'
         (notes / "r5.txt").write_text("r5\n")
-        p = mv("r5"); ts.shown_id = p.id; i = seed(); now[0] += 301
+        p = mv("r5"); ts.shown_id = p.id; i = seed(p.id); now[0] += 301
         assert (await http.get(f"{base}/api/actions/pending")).json() == []
-        assert ts.shown_id is None and ts.last_outcome == "expired"
+        assert ts.shown_id is None
         scrubbed(i, "expired", "it expired")
     finally:
         pend._clock = real_clock
     # resolving card A while a NEWER card B is live: B's traces stay, and the spoken line is the _LIVE variant
     (notes / "r6.txt").write_text("r6\n")
-    pa = mv("r6"); ts.shown_id = "B-live"; i = seed()
+    pa = mv("r6"); i = seed(pa.id)
+    cx.add_message({"role": "user", "content": "and another change"})
+    ts.shown_id = "B-live"; j = seed("B-live")
     n_before = len(frames)
     assert (await http.post(f"{base}/api/actions/{pa.id}/deny", json={})).status_code == 200
-    assert "awaiting_user_confirmation" in cx.messages[i + 1]["content"] and CLAIM == cx.messages[i + 2]["content"]
+    scrubbed(i, "denied by the user", "the user denied it")                      # A's own traces: scrubbed
+    assert "awaiting_user_confirmation" in cx.messages[j + 1]["content"] and CLAIM == cx.messages[j + 2]["content"]
+    assert ts.shown_id == "B-live"                                               # B's card and traces untouched
     assert _ts.SPEAK_DENIED_LIVE in spoken(frames[n_before:]) and _ts.SPEAK_DENIED not in spoken(frames[n_before:])
     ts.shown_id = None
-    _ts.retire_cards(cx, "cleared")
     print("actions: real routes scrub the real context per outcome (done/denied/failed/expired/timeout): ok")
 
     # foreign session id: 404, and the other session's action stays pending

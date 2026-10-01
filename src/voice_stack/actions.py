@@ -242,6 +242,13 @@ class PendingActions:
         self._flush(events)
         return len(gone)
 
+    def spent_reason(self, action_id: str, session_id: str) -> str | None:
+        """Why a no-longer-pending id of this session is gone: 'expired' (timed out), 'used'
+        (taken by approve/deny, possibly still executing, or discarded), or None (unknown)."""
+        with self._lock:
+            owner = self._spent.get(action_id) if isinstance(action_id, str) else None
+        return owner[1] if owner is not None and owner[0] == session_id else None
+
     def list(self, session_id: str) -> list[dict]:
         events: list = []
         with self._lock:

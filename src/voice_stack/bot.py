@@ -106,7 +106,7 @@ async def false_card_backstop(tools, text: str | None, queue) -> bool:
         if tools.proposing > 0:
             return False
         tools.corrected_turn = True
-        toolset.retire_cards(tools.context, tools.last_outcome or "cleared")
+        toolset.retire_stale_claims(tools.context)   # no card exists: the made-up claim reads as neutral
         await queue(RTVIServerMessageFrame(data={"type": "actions_cleared"}))
         await queue(TTSSpeakFrame(toolset.SPEAK_CORRECTION, append_to_context=True))
         return True
@@ -133,13 +133,12 @@ async def false_done_backstop(tools, text: str | None, queue) -> bool:
 
 
 async def user_turn_started(tools, context) -> None:
-    """Tools mode, a new user turn begins: reset per-turn flags; a timed-out card is dead (clear it,
-    scrub 'expired'); with no live card, scrub stale 'a card is on screen' traces from the context
-    using how the last card ended."""
+    """Tools mode, a new user turn begins: reset per-turn flags; a card that TIMED OUT is dead (clear it,
+    scrub 'expired'; one still being approved is left to its route); re-apply each ended card's own
+    outcome and neutralise leftover card claims when no card is live."""
     tools.reset_turn()
     await toolset.refresh_shown(tools)
-    if tools.shown_id is None:
-        toolset.retire_cards(context, tools.last_outcome or "cleared")
+    toolset.settle_cards(tools)
 
 
 def make_assistant_turn_handler(
