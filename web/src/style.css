@@ -147,16 +147,17 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .action-card-host[hidden] { display: none; }
 .action-card {
   pointer-events: auto; max-width: 720px; margin: 0 auto; display: flex; flex-direction: column;
-  max-height: calc(100vh - var(--controls-h, 68px) - 24px);
+  max-height: calc(100vh - var(--controls-h, 68px) - 24px); overflow-y: auto;
   background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--accent);
   border-radius: 10px; padding: 14px 16px; outline: none; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
 }
 .action-card:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .action-card h2 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
-.action-summary { margin: 0 0 8px; overflow: hidden; overflow-wrap: anywhere; white-space: pre-wrap; contain: paint; }
+.action-card > * { flex: none; }
+.action-summary { margin: 0 0 8px; overflow: visible; overflow-wrap: anywhere; white-space: pre-wrap; }
 .action-stats { margin: 0 0 6px; font-size: 13px; color: var(--text-dim); }
 .action-diff {
-  margin: 0; padding: 8px 0; flex: 0 1 auto; min-height: 60px; max-height: 50vh; overflow-y: scroll; overflow-x: hidden;
+  margin: 0; padding: 8px 0; min-height: 60px; max-height: 50vh; overflow-y: scroll; overflow-x: hidden;
   border-radius: 8px; background: #0d0d10; border: 1px solid #262c36; color: #e6e9ef;
   font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4;
 }
@@ -170,14 +171,15 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .action-diff .add { background: rgba(70, 209, 154, 0.16); color: #7ee2b8; }
 .action-diff .del { background: rgba(255, 107, 107, 0.16); color: #ff9a9a; }
 .action-diff .ctx { color: #98a1b0; }
-.action-hint { margin: 4px 0 0; font-size: 12px; color: var(--accent); }
+.action-card > .action-diff { flex: 0 1 auto; }
+.action-hint { margin: 4px 0 0; padding: 2px 0; font-size: 12px; color: var(--accent); position: sticky; bottom: 0; background: var(--panel); }
 .esc {
   display: inline-block; padding: 0 4px; margin: 0 1px; border-radius: 4px; font-size: 0.85em;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.3;
   background: #5a2d82; color: #fff; border: 1px solid #b78cff; white-space: nowrap;
   unicode-bidi: isolate; direction: ltr;
 }
-.esc.spaces { background: #7a4a00; border-color: #ffb454; }
+.esc.spaces { background: #7a4a00; border-color: #ffb454; font-size: 0.95em; padding: 0 6px; }
 .action-error { margin: 8px 0 0; color: var(--danger); font-size: 14px; }
 .action-buttons { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex: none; }
 .action-buttons .btn.approve { background: var(--accent); border-color: transparent; color: #1a0d08; font-weight: 600; }

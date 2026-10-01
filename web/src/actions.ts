@@ -14,7 +14,7 @@ export type PublicAction = {
 };
 
 export type Decision = "approve" | "deny";
-export type Segment = { kind: "text" | "esc"; text: string; spaces?: boolean };
+export type Segment = { kind: "text" | "esc"; text: string; spaces?: boolean; label?: string };
 
 export const ARM_DELAY_MS = 500;
 export const RESULT_MS = 4000;
@@ -33,6 +33,13 @@ function escapeOf(cp: number): string {
 }
 
 type Token = { esc: boolean; s: string };
+
+/** Screen-reader text for an escape chip such as `\u202e`, `\U000e0020` or `\t`. */
+function labelOf(esc: string): string {
+  if (esc === "\\t") return "tab character";
+  const cp = parseInt(esc.slice(2), 16);
+  return `hidden character U+${cp.toString(16).toUpperCase().padStart(4, "0")}`;
+}
 
 /**
  * Server display contract: a real backslash arrives as `\\`; hidden chars as
@@ -102,7 +109,7 @@ export function parseServerText(s: string, maxLeadingSpaces = MAX_LEADING_SPACES
     const leadingOk = !seen && spaces <= maxLeadingSpaces && !atEnd;
     if (spaces >= 3 && !leadingOk) {
       flush();
-      out.push({ kind: "esc", text: `␠×${spaces}`, spaces: true });
+      out.push({ kind: "esc", text: `sp\u00d7${spaces}`, spaces: true, label: `${spaces} spaces` });
     } else {
       buf += " ".repeat(spaces);
     }
@@ -113,7 +120,7 @@ export function parseServerText(s: string, maxLeadingSpaces = MAX_LEADING_SPACES
     if (tok.esc) {
       flushSpaces(false);
       flush();
-      out.push({ kind: "esc", text: tok.s });
+      out.push({ kind: "esc", text: tok.s, label: labelOf(tok.s) });
       seen = true;
       prev = "x";
       run = 0;
@@ -132,7 +139,8 @@ export function parseServerText(s: string, maxLeadingSpaces = MAX_LEADING_SPACES
         SUSPICIOUS.test(ch) || (mark && (/\s/u.test(prev) || prev === "/" || run > 2));
       if (bad) {
         flush();
-        out.push({ kind: "esc", text: escapeOf(ch.codePointAt(0)!) });
+        const e = escapeOf(ch.codePointAt(0)!);
+        out.push({ kind: "esc", text: e, label: labelOf(e) });
       } else {
         buf += ch;
       }
@@ -153,6 +161,10 @@ function appendSegments(parent: HTMLElement, segs: Segment[]): void {
       const chip = document.createElement("span");
       chip.className = seg.spaces ? "esc spaces" : "esc";
       chip.textContent = seg.text;
+      if (seg.label) {
+        chip.setAttribute("role", "img");
+        chip.setAttribute("aria-label", seg.label);
+      }
       parent.append(chip);
     }
   }
@@ -218,8 +230,9 @@ export class ActionCard {
   // Approve gating: all of these must hold.
   private timeArmed = false;
   private armStart = 0;
-  private scrollNeeded = false;
-  private scrolledEnd = true;
+  /** Per scroll container: last geometry and whether its end has been seen. */
+  private readonly seen = new Map<HTMLElement, { geom: string; ok: boolean }>();
+  private lockedBy: "diff" | "card" | null = null;
   private decided = false;
   private armTimer: number | undefined;
   private expiryTimer: number | undefined;
@@ -270,8 +283,8 @@ export class ActionCard {
     this.decided = false;
     this.timeArmed = false;
     this.armStart = 0;
-    this.scrollNeeded = false;
-    this.scrolledEnd = true;
+    this.seen.clear();
+    this.lockedBy = null;
     this.expiresText = expiryCaption(a.expires_in);
 
     const card = document.createElement("div");
@@ -315,13 +328,14 @@ export class ActionCard {
         pre.append(span);
       }
       pre.addEventListener("scroll", this.env, { passive: true });
-      this.hintEl = document.createElement("p");
-      this.hintEl.className = "action-hint";
-      this.hintEl.textContent = "Scroll to see the rest of the changes.";
-      this.hintEl.hidden = true;
       this.diffEl = pre;
-      card.append(stats, pre, this.hintEl);
+      card.append(stats, pre);
     }
+    card.addEventListener("scroll", this.env, { passive: true });
+    this.hintEl = document.createElement("p");
+    this.hintEl.className = "action-hint";
+    this.hintEl.hidden = true;
+    card.append(this.hintEl);
 
     this.errorEl = document.createElement("p");
     this.errorEl.className = "action-error srv";
@@ -342,12 +356,6 @@ export class ActionCard {
     this.host.hidden = false;
     card.scrollIntoView({ block: "nearest" });
     card.focus({ preventScroll: true }); // the container, never Approve
-
-    if (this.diffEl) {
-      const d = this.diffEl;
-      this.scrollNeeded = d.scrollHeight - d.clientHeight > 2;
-      this.scrolledEnd = !this.scrollNeeded;
-    }
 
     document.addEventListener("visibilitychange", this.env);
     window.addEventListener("focus", this.env);
@@ -384,7 +392,37 @@ export class ActionCard {
     const b = this.approveBtn;
     if (!b) return false;
     const r = b.getBoundingClientRect();
-    return r.width > 0 && r.top >= 0 && r.left >= 0 && r.bottom <= window.innerHeight && r.right <= window.innerWidth;
+    if (!(r.width > 0 && r.top >= 0 && r.left >= 0 && r.bottom <= window.innerHeight && r.right <= window.innerWidth)) return false;
+    // Also inside the card's own (possibly scrolled) visible area.
+    const c = this.card?.getBoundingClientRect();
+    return !!c && r.top >= c.top && r.bottom <= c.bottom;
+  }
+
+  /**
+   * "Everything the user must see has been seen": every scroll container (the
+   * card and the diff) either fits or has been scrolled to its end. A latch per
+   * container, reset whenever its geometry changes (resize / zoom) unless it is
+   * at the end or fits.
+   */
+  private updateSeen(): boolean {
+    this.lockedBy = null;
+    const els: Array<["diff" | "card", HTMLElement | null]> = [["diff", this.diffEl], ["card", this.card]];
+    for (const [name, el] of els) {
+      if (!el) continue;
+      const needs = el.scrollHeight - el.clientHeight > 2;
+      const end = el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
+      const geom = `${el.scrollHeight}:${el.clientHeight}`;
+      const st = this.seen.get(el) ?? { geom: "", ok: false };
+      if (geom !== st.geom) {
+        st.geom = geom;
+        st.ok = !needs || end;
+      } else if (!needs || end) {
+        st.ok = true;
+      }
+      this.seen.set(el, st);
+      if (!st.ok && this.lockedBy === null) this.lockedBy = name;
+    }
+    return this.lockedBy === null;
   }
 
   private canApprove(): boolean {
@@ -392,7 +430,7 @@ export class ActionCard {
       !this.decided &&
       this.timeArmed &&
       performance.now() - this.armStart >= ARM_DELAY_MS &&
-      this.scrolledEnd &&
+      this.updateSeen() &&
       this.envOk()
     );
   }
@@ -400,11 +438,7 @@ export class ActionCard {
   /** Re-check visibility/focus/scroll; (re)start the arm delay when conditions break. */
   private reevaluate(): void {
     if (!this.current || this.decided) return;
-    const d = this.diffEl;
-    if (d) {
-      this.scrollNeeded = d.scrollHeight - d.clientHeight > 2;
-      if (!this.scrollNeeded || d.scrollTop + d.clientHeight >= d.scrollHeight - 2) this.scrolledEnd = true;
-    }
+    this.updateSeen();
     if (!this.envOk()) {
       window.clearTimeout(this.armTimer);
       this.armTimer = undefined;
@@ -428,9 +462,13 @@ export class ActionCard {
     a.disabled = this.decided || !can;
     a.textContent = this.timeArmed ? a.dataset.label ?? "" : "arming…";
     d.disabled = this.decided; // Deny / Esc work immediately
-    if (this.hintEl) this.hintEl.hidden = !(this.scrollNeeded && !this.scrolledEnd);
+    if (this.hintEl) {
+      this.hintEl.hidden = this.lockedBy === null;
+      this.hintEl.textContent =
+        this.lockedBy === "diff" ? "Scroll to see the rest of the changes." : "Scroll down to see the whole request.";
+    }
     if (this.captionEl) {
-      this.captionEl.textContent = !this.scrolledEnd ? "scroll to the end to enable Approve" : this.expiresText;
+      this.captionEl.textContent = this.lockedBy !== null ? "scroll to the end to enable Approve" : this.expiresText;
     }
   }
 

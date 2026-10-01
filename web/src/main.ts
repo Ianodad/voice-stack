@@ -660,11 +660,11 @@ function handleServerMessage(gen: number, data: unknown): void {
         const text = resultFor(status, card.currentKind, m.summary);
         card.finish(true);
         card.showResult(text);
-      } else if (!card.isClosed(m.id)) {
-        // Unknown id we never showed (e.g. decided from another tab): say so once.
+      } else {
+        // Not the displayed card: never clear or announce anything for it, but
+        // remember it is finished so a late resync cannot resurrect it.
         card.markClosed(m.id);
-        card.showResult(resultFor(status, null, m.summary));
-      } // else: already handled locally; do not announce twice
+      }
       return;
     }
     case "actions_cleared":
@@ -732,6 +732,11 @@ muteBtn.addEventListener("click", () => {
 stopBtn.addEventListener("click", () => void disconnectByUser());
 $("new-btn").addEventListener("click", () => void connect(null));
 
+/** Space on one of the card's own buttons must press it; anywhere else it is push-to-talk. */
+function onCardButton(t: EventTarget | null): boolean {
+  return t instanceof HTMLElement && card.contains(t) && !!t.closest("button");
+}
+
 function inTextField(t: EventTarget | null): boolean {
   return (
     t instanceof HTMLInputElement ||
@@ -762,7 +767,7 @@ window.addEventListener("keydown", (e) => {
     }
     return;
   }
-  if (e.code === "Space" && conn === "live" && muted && !card.contains(e.target)) {
+  if (e.code === "Space" && conn === "live" && muted && !onCardButton(e.target)) {
     e.preventDefault(); // also stops a focused button from "clicking"
     if (e.repeat || pttHeld) return;
     pttHeld = true;
