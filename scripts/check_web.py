@@ -425,6 +425,40 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
         pend._clock = real_clock
     print("actions: expired approve -> 409 + expired + actions_cleared: ok")
 
+    # cleanup 3: expired card already swept by GET /pending -> approve still reports 'expired' + clears UI
+    now = [5000.0]
+    pend._clock = lambda: now[0]
+    try:
+        p = pend.propose(sid, "move", {"src": "notes/d.txt", "dst": "archive/d.txt"})
+        live.tool_session.shown_id = p.id
+        now[0] += 301
+        assert (await http.get(f"{base}/api/actions/pending")).json() == []      # sweeps it
+        n_before = len(frames)
+        r = await http.post(f"{base}/api/actions/{p.id}/approve", json={})
+        assert r.status_code == 409 and "error" not in r.json(), (r.status_code, r.text)
+        new = msgs(frames[n_before:])
+        assert [m["type"] for m in new] == ["action_result", "actions_cleared"] and new[0]["status"] == "expired", new
+        assert live.tool_session.shown_id is None
+        r = await http.post(f"{base}/api/actions/{p.id}/approve", json={})
+        assert r.status_code == 409 and r.json().get("error") == "already handled"
+    finally:
+        pend._clock = real_clock
+    print("actions: swept-expired card still reported 'expired' once: ok")
+
+    # cleanup 2: action_result summary == card summary exactly, even with escape-heavy names
+    nm = "notes/" + "\\" * 90 + "w.txt"          # backslashes display doubled (tools reject invisible chars)
+    (root / nm).write_text("w\n")
+    p = pend.propose(sid, "move", {"src": nm, "dst": "archive/" + "\\" * 91 + "w.txt"})
+    card = (await http.get(f"{base}/api/actions/pending")).json()[0]
+    assert card["id"] == p.id and len(card["summary"]) > 200, len(card["summary"])
+    r = await http.post(f"{base}/api/actions/{p.id}/approve", json={})
+    assert r.status_code == 200, (r.status_code, r.text)
+    res = msgs(frames, "action_result")[-1]
+    assert res["summary"] == card["summary"] == r.json()["summary"], "action_result summary differs from the card"
+    import re as _re
+    assert len(res["summary"]) > 300 and res["summary"].endswith("w.txt"), "summary was cut"
+    print("actions: action_result summary identical to card summary (long, escape-heavy): ok")
+
     # I1 at HTTP level: resolving A while B's card is the one shown must keep B's marker
     pa = pend.propose(sid, "move", {"src": "notes/d.txt", "dst": "archive/d.txt"})
     live.tool_session.shown_id = "B-card-id"
@@ -500,14 +534,28 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
 
 
 async def fresh_root_mode(rt) -> None:
-    """M5: a freshly created sandbox root is 0700."""
+    """M5: fresh root 0700; existing real dir owned by us 0700; symlinked root: target mode UNCHANGED."""
     import stat as _stat
     with tempfile.TemporaryDirectory() as d:
         fresh = Path(d) / "VoiceAssistant"
         app2 = create_app(rt, History(Path(d) / "h2.db"), None, root=fresh)
         async with app2.router.lifespan_context(app2):
             assert fresh.is_dir() and _stat.S_IMODE(fresh.stat().st_mode) == 0o700, oct(fresh.stat().st_mode)
-    print("sandbox root created 0700: ok")
+        # existing real directory (0755) owned by us -> 0700
+        existing = Path(d) / "existing"
+        existing.mkdir(mode=0o755); existing.chmod(0o755)
+        app3 = create_app(rt, History(Path(d) / "h3.db"), None, root=existing)
+        async with app3.router.lifespan_context(app3):
+            assert _stat.S_IMODE(existing.stat().st_mode) == 0o700, oct(existing.stat().st_mode)
+        # symlinked root: the (shared) target must keep its mode
+        target = Path(d) / "shared"
+        target.mkdir(); target.chmod(0o755)
+        link = Path(d) / "link"
+        link.symlink_to(target)
+        app4 = create_app(rt, History(Path(d) / "h4.db"), None, root=link)
+        async with app4.router.lifespan_context(app4):
+            assert _stat.S_IMODE(target.stat().st_mode) == 0o755, f"symlink target chmod'ed: {oct(target.stat().st_mode)}"
+    print("sandbox root: fresh 0700, existing own dir 0700, symlink target untouched: ok")
 
 
 async def main() -> None:

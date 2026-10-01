@@ -180,6 +180,26 @@ with tempfile.TemporaryDirectory() as d:
     (root/"c.txt").write_text("c"); r = pa.propose("R1", "move", {"src": "c.txt", "dst": "archive/c.txt"})
     (root/"c.txt").unlink()
     assert reason(pa.approve, r.id, "R1") == "failed"
+# (cleanup 3) swept-expired ids keep the 'expired' reason, reported once, then 'used'
+with tempfile.TemporaryDirectory() as d:
+    root = Path(d).resolve(); (root/"a.txt").write_text("a"); (root/"b.txt").write_text("b"); (root/"archive").mkdir()
+    clk = Clock(); pa = PendingActions(root, clock=clk)
+    def reason2(fn, *a):
+        try: fn(*a)
+        except ActionError as e: return (e.status, e.reason)
+        raise AssertionError("no ActionError")
+    for sweeper in ("list", "propose"):
+        p = pa.propose("X1", "move", {"src": "a.txt", "dst": "archive/a.txt"}); clk.t += 301
+        if sweeper == "list": assert pa.list("X1") == []
+        else:
+            n = pa.propose("X1", "move", {"src": "b.txt", "dst": "archive/b.txt"}); pa.deny(n.id, "X1")
+        assert reason2(pa.approve, p.id, "X1") == (409, "expired"), sweeper
+        assert reason2(pa.deny, p.id, "X1") == (409, "used")
+        assert reason2(pa.approve, p.id, "X9") == (404, "unknown")
+    assert (root/"a.txt").exists()
+    # discarded (session end) ids are 'used', not 'expired'
+    q = pa.propose("X2", "move", {"src": "a.txt", "dst": "archive/a2.txt"}); pa.discard_session("X2")
+    assert reason2(pa.approve, q.id, "X2") == (409, "used")
 # (M4) tools hide the audit file in every spelling
 with tempfile.TemporaryDirectory() as d:
     root = Path(d).resolve(); (root/"a.txt").write_text("a"); (root/".audit.jsonl").write_text("{}\n")

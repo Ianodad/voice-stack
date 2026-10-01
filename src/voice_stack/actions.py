@@ -82,7 +82,7 @@ class PendingActions:
         self._exec_lock = threading.Lock()     # serialises apply_* calls
         self._audit_lock = threading.Lock()
         self._items: dict[str, Pending] = {}
-        self._spent: OrderedDict[str, str] = OrderedDict()   # id -> session that owned it
+        self._spent: OrderedDict[str, tuple[str, str]] = OrderedDict()   # id -> (owning session, how it ended)
 
     # ------------------------------------------------------------ audit
     def _audit(self, event: str, p: Pending | None = None, detail: str = "", *,
@@ -115,15 +115,16 @@ class PendingActions:
     def _expired(self, p: Pending) -> bool:
         return self._clock() - p.created_at > self._ttl
 
-    def _mark_spent(self, p: Pending) -> None:
-        self._spent[p.id] = p.session_id
+    def _mark_spent(self, p: Pending, why: str = "used") -> None:
+        """why: 'expired' (timed out) or 'used' (approved/denied/discarded)."""
+        self._spent[p.id] = (p.session_id, why)
         while len(self._spent) > SPENT_CAP:
             self._spent.popitem(last=False)
 
     def _sweep_locked(self, events: list) -> None:
         for pid in [i for i, p in self._items.items() if self._expired(p)]:
             p = self._items.pop(pid)
-            self._mark_spent(p)
+            self._mark_spent(p, "expired")
             events.append(("expire", p, "expired before a decision"))
 
     def _view(self, p: Pending) -> Pending:
@@ -140,7 +141,11 @@ class PendingActions:
                 p = self._items.get(action_id) if isinstance(action_id, str) else None
                 if p is None:
                     owner = self._spent.get(action_id) if isinstance(action_id, str) else None
-                    if owner is not None and owner == session_id:
+                    if owner is not None and owner[0] == session_id:
+                        if owner[1] == "expired":
+                            # swept earlier (GET/list or a new proposal); the first decision attempt reports it
+                            self._spent[action_id] = (owner[0], "used")
+                            raise ActionError(409, "that action expired", "expired")
                         raise ActionError(409, "that action was already used or has expired", "used")
                     raise ActionError(404, "no such pending action")
                 if p.session_id != session_id:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import stat
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -212,6 +213,25 @@ class SessionManager:
             await asyncio.wait({task}, timeout=CANCEL_TIMEOUT)
 
 
+def _secure_root(root: Path) -> None:
+    """Create the sandbox root 0700. Only chmod a directory we just created, or an existing
+    real (non-symlink) directory owned by this user; never follow a symlink."""
+    if root.is_symlink():
+        logger.warning("sandbox root {} is a symlink; leaving its permissions alone", root)
+        root.mkdir(parents=True, exist_ok=True)       # no-op if the target exists
+        return
+    created = not root.exists()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        st = os.lstat(root)
+        if created or (stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid()):
+            os.chmod(root, 0o700)
+        else:
+            logger.warning("sandbox root {} is not a directory owned by this user; permissions unchanged", root)
+    except OSError:
+        logger.warning("could not chmod sandbox root {} to 0700", root)
+
+
 def create_app(runtime: Runtime, history: History, static_dir: Path | None,
                root: Path | None = None) -> FastAPI:
     root = Path(root) if root is not None else tools.DEFAULT_ROOT
@@ -221,11 +241,7 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            os.chmod(root, 0o700)
-        except OSError:
-            logger.warning("could not chmod sandbox root {} to 0700", root)
+        _secure_root(root)
         try:
             yield
         finally:
@@ -324,7 +340,9 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
         except ActionError as e:
             await _on_failure(sid, action_id, e)
             return _error(e)
-        summary = _clean(result.get("summary", ""), 200)     # plan summary (already escaped for display)
+        # Plan summary as-is: already escaped for display and identical to what the card shows.
+        # (Never truncate it here: a cut can split a \\uXXXX / \\UXXXXXXXX / \\\\ escape.)
+        summary = str(result.get("summary", ""))
         live = sessions.live_session(sid)
         if live is not None:
             _clear_shown(live, action_id)
