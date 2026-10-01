@@ -268,7 +268,7 @@ async def unit_sweep() -> None:
 from voice_stack import toolset as _ts  # noqa: E402  (the server's fixed spoken lines)
 
 FIXED_SPOKEN = {_ts.SPEAK_DONE["move"], _ts.SPEAK_DONE["edit"], _ts.SPEAK_DENIED, _ts.SPEAK_FAILED,
-                _ts.SPEAK_EXPIRED, _ts.SPEAK_DONE_DEFAULT}
+                _ts.SPEAK_EXPIRED, _ts.SPEAK_DONE_DEFAULT, _ts.SPEAK_DENIED_LIVE, _ts.SPEAK_EXPIRED_LIVE}
 
 
 async def actions_section(base, http, app, sessions, root: Path) -> None:
@@ -466,6 +466,70 @@ async def _actions_section(base, http, app, sessions, root: Path, clients: list)
     r = await http.post(f"{base}/api/actions/{pa.id}/deny", json={})
     assert r.status_code == 200 and live.tool_session.shown_id == "B-card-id", live.tool_session.shown_id
     live.tool_session.shown_id = None
+
+    # fix round 1: the REAL routes scrub the model's real LLMContext with outcome-specific wording;
+    # read/search evidence is never touched; a newer live card is never scrubbed or denied "no card"
+    import json as _json
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    ts = live.tool_session
+    if ts.context is None:                       # stub worker: attach a real LLMContext as build_worker does
+        ts.context = LLMContext()
+    cx = ts.context
+    ts.shown_id = None
+    CLAIM = "A confirmation card is on screen waiting for your approval."
+
+    def seed():
+        cx.add_messages([
+            {"role": "tool", "tool_call_id": "rd", "content": '{"content": "alert when load > 5"}'},
+            {"role": "tool", "tool_call_id": "cd", "content": _json.dumps({"status": "awaiting_user_confirmation"})},
+            {"role": "assistant", "content": CLAIM}])
+        return len(cx.messages) - 3
+
+    def scrubbed(i, tool_word, say_word):
+        m = cx.messages
+        assert m[i]["content"] == '{"content": "alert when load > 5"}', m[i]               # evidence untouched
+        assert tool_word in m[i + 1]["content"] and "awaiting_user_confirmation" not in m[i + 1]["content"], m[i + 1]
+        assert say_word in m[i + 2]["content"] and "card" not in m[i + 2]["content"], m[i + 2]
+
+    for name in ("r1", "r2", "r3", "r4"):
+        (notes / f"{name}.txt").write_text(name + "\n")
+    mv = lambda n: pend.propose(sid, "move", {"src": f"notes/{n}.txt", "dst": f"archive/{n}.txt"})
+    p = mv("r1"); ts.shown_id = p.id; i = seed()
+    assert (await http.post(f"{base}/api/actions/{p.id}/approve", json={})).status_code == 200
+    scrubbed(i, "WAS applied", "the user approved it")
+    assert ts.last_outcome == "done"
+    p = mv("r2"); ts.shown_id = p.id; i = seed()
+    assert (await http.post(f"{base}/api/actions/{p.id}/deny", json={})).status_code == 200
+    scrubbed(i, "denied by the user", "the user denied it")
+    assert _ts.SPEAK_DENIED in spoken(frames)
+    p = mv("r3"); ts.shown_id = p.id; i = seed(); (notes / "r3.txt").unlink()
+    assert (await http.post(f"{base}/api/actions/{p.id}/approve", json={})).status_code == 422
+    scrubbed(i, "failed", "it failed")
+    # expiry via the approve route
+    now = [5000.0]; real_clock = pend._clock; pend._clock = lambda: now[0]
+    try:
+        p = mv("r4"); ts.shown_id = p.id; i = seed(); now[0] += 301
+        assert (await http.post(f"{base}/api/actions/{p.id}/approve", json={})).status_code == 409
+        scrubbed(i, "expired", "it expired")
+        assert _ts.SPEAK_EXPIRED in spoken(frames)
+        # a card that simply times out: GET /pending notices the dead shown_id, clears it, scrubs 'expired'
+        (notes / "r5.txt").write_text("r5\n")
+        p = mv("r5"); ts.shown_id = p.id; i = seed(); now[0] += 301
+        assert (await http.get(f"{base}/api/actions/pending")).json() == []
+        assert ts.shown_id is None and ts.last_outcome == "expired"
+        scrubbed(i, "expired", "it expired")
+    finally:
+        pend._clock = real_clock
+    # resolving card A while a NEWER card B is live: B's traces stay, and the spoken line is the _LIVE variant
+    (notes / "r6.txt").write_text("r6\n")
+    pa = mv("r6"); ts.shown_id = "B-live"; i = seed()
+    n_before = len(frames)
+    assert (await http.post(f"{base}/api/actions/{pa.id}/deny", json={})).status_code == 200
+    assert "awaiting_user_confirmation" in cx.messages[i + 1]["content"] and CLAIM == cx.messages[i + 2]["content"]
+    assert _ts.SPEAK_DENIED_LIVE in spoken(frames[n_before:]) and _ts.SPEAK_DENIED not in spoken(frames[n_before:])
+    ts.shown_id = None
+    _ts.retire_cards(cx, "cleared")
+    print("actions: real routes scrub the real context per outcome (done/denied/failed/expired/timeout): ok")
 
     # foreign session id: 404, and the other session's action stays pending
     other = pend.propose("someone-else", "move", {"src": "notes/e.txt", "dst": "archive/e.txt"})

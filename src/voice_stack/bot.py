@@ -88,25 +88,58 @@ def reply_content(tap: ReplyTap, context: LLMContext, message) -> str:
 
 
 async def false_card_backstop(tools, text: str | None, queue) -> bool:
-    """Tools mode: the finished assistant turn claims a confirmation card, yet no card is pending and
-    none was proposed this turn -> the model repeated an old reply. Queue a fixed correction (it
-    enters context as the assistant's words) and clear the UI's cards. At most once per turn.
+    """Tools mode: the finished assistant turn claims a confirmation card, yet no card is live
+    (pending AND shown) and none is being or was proposed this turn -> the model repeated an old
+    reply. Queue a fixed correction (it enters context as the assistant's words) and clear the UI's
+    cards. At most once per turn; never while a proposal is in flight or a card is live.
     `queue(frame)` awaits worker.queue_frame. Never raises. Returns True when it fired."""
     try:
-        if tools is None or tools.corrected_turn or tools.proposed_turn or tools.shown_id is not None:
+        if tools is None or tools.corrected_turn or tools.proposed_turn:
             return False
         if text == toolset.SPEAK_CORRECTION or not toolset.claims_card(text):
             return False
+        await toolset.refresh_shown(tools)      # a timed-out card is not live: clears shown_id
+        if tools.shown_id is not None:
+            return False
         if await asyncio.to_thread(tools.pending.list, tools.session_id):
             return False        # a real card is pending: the claim is true
+        if tools.proposing > 0:
+            return False
         tools.corrected_turn = True
-        toolset.retire_cards(tools.context)
+        toolset.retire_cards(tools.context, tools.last_outcome or "cleared")
         await queue(RTVIServerMessageFrame(data={"type": "actions_cleared"}))
         await queue(TTSSpeakFrame(toolset.SPEAK_CORRECTION, append_to_context=True))
         return True
     except Exception:
         logger.exception("false-card backstop failed")
         return False
+
+
+async def false_done_backstop(tools, text: str | None, queue) -> bool:
+    """Tools mode: a card was proposed this turn (and is pending) but the reply says 'I've updated /
+    moved ...' -- a false claim the card contradicts. Queue ONE fixed clarification (in context).
+    At most once per turn. Never raises. Returns True when it fired."""
+    try:
+        if tools is None or tools.clarified_turn or not tools.proposed_turn or not toolset.claims_done(text):
+            return False
+        if not await asyncio.to_thread(tools.pending.list, tools.session_id):
+            return False        # the card is already resolved: the claim may be true
+        tools.clarified_turn = True
+        await queue(TTSSpeakFrame(toolset.SPEAK_CLARIFY, append_to_context=True))
+        return True
+    except Exception:
+        logger.exception("false-done backstop failed")
+        return False
+
+
+async def user_turn_started(tools, context) -> None:
+    """Tools mode, a new user turn begins: reset per-turn flags; a timed-out card is dead (clear it,
+    scrub 'expired'); with no live card, scrub stale 'a card is on screen' traces from the context
+    using how the last card ended."""
+    tools.reset_turn()
+    await toolset.refresh_shown(tools)
+    if tools.shown_id is None:
+        toolset.retire_cards(context, tools.last_outcome or "cleared")
 
 
 def make_assistant_turn_handler(
@@ -119,7 +152,8 @@ def make_assistant_turn_handler(
         if on_turn is not None and content and content.strip():
             on_turn("assistant", content)
         if tools is not None and queue is not None:
-            await false_card_backstop(tools, content, queue)
+            if not await false_card_backstop(tools, content, queue):
+                await false_done_backstop(tools, content, queue)
 
     return _on_assistant_turn_stopped
 
@@ -195,9 +229,7 @@ def build_worker(
 
         @user_agg.event_handler("on_user_turn_started")
         async def _on_user_turn_started(aggregator, strategy):
-            tools.reset_turn()
-            if tools.shown_id is None:
-                toolset.retire_cards(context)   # no live card: scrub stale 'on screen' traces
+            await user_turn_started(tools, context)
 
     if on_turn is not None:
 

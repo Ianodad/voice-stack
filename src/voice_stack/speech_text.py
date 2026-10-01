@@ -16,22 +16,36 @@ _FENCE = re.compile(r"^[ \t]*`{3,}[\w+-]*[ \t]*$", re.M)   # a fence line only; 
 _INLINE_CODE = re.compile(r"`([^`\n]*)`")
 _HEADER = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.*?)(?:[ \t]+#+[ \t]*)?$", re.M)
 _RULE = re.compile(r"^[ \t]*([-*_=])(?:[ \t]*\1){2,}[ \t]*$", re.M)
-_QUOTE = re.compile(r"^[ \t]*>+[ \t]?", re.M)
-_BULLET = re.compile(r"^[ \t]*[-*+•●◦][ \t]+", re.M)
+_QUOTE = re.compile(r"^[ \t]*>+[ \t]?(?=[^\W\d_])", re.M)   # "> Note" yes, "> 5 servers" no
+_BULLET = re.compile(r"^[ \t]*[-*+•●◦][ \t]+(?=[^\W\d]|[*`\[(\"'])", re.M)   # "- item" yes, "- 5 degrees" no
 _TABLE_SEP = re.compile(r"^[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*(\|[ \t]*:?-{2,}:?[ \t]*)*\|?[ \t]*$", re.M)
 _TABLE_ROW = re.compile(r"^[ \t]*\|(.*)\|[ \t]*$", re.M)
 _BOLD = re.compile(r"(?<![\w*])\*\*(?=[^\s*])(.+?)(?<=[^\s*])\*\*(?![\w*])", re.S)  # __x__ left alone: __init__
-_ITAL_STAR = re.compile(r"(?<![\w*])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![\w*])", re.S)
+_ITAL_STAR = re.compile(r"(?<![\w*])\*(?=[^\W\d])(.+?)(?<=[^\s*])\*(?![\w*])", re.S)
 _ITAL_UND = re.compile(r"(?<![\w_])_(?=[^\s_])(.+?)(?<=[^\s_])_(?![\w_])", re.S)
 _STRIKE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~", re.S)
 _STRAY_STAR2 = re.compile(r"\*{2,}")
 # a lone star glued to a word on one side only: an emphasis mark whose partner is in another chunk
-_STRAY_STAR = re.compile(r"(?<![\w*])\*(?=\w)|(?<=\w)\*(?![\w*])")
+_STRAY_STAR = re.compile(r"(?<![\w*])\*(?=[^\W\d])|(?<=[^\W\d])\*(?![\w*])")   # "3 *4" stays
 _BLANKS = re.compile(r"\n{2,}")
 _ONLY_MARKS = re.compile(r"^[\s\-*_#>|~`=+.:•]*$")
 
 
+_MAX_FULL = 8192   # bigger chunks get only the linear strips: lazy spans could go quadratic
+_CHEAP_BOLD = re.compile(r"\*\*")
+
+
+def _cheap(text: str) -> str:
+    t = text.replace("`", "")
+    t = _CHEAP_BOLD.sub("", t)
+    t = _HEADER.sub(r"\1", t)
+    t = _BULLET.sub("", t)
+    return t.strip()
+
+
 def strip_markdown(text: str) -> str:
+    if len(text) > _MAX_FULL:
+        return _cheap(text)
     t = _IMAGE.sub(r"\1", text)
     t = _LINK.sub(r"\1", t)
     t = _FENCE.sub("", t)

@@ -34,11 +34,14 @@ from voice_stack.history import History
 from voice_stack.runtime import Runtime
 from voice_stack.toolset import (
     SPEAK_DENIED,
+    SPEAK_DENIED_LIVE,
     SPEAK_DONE,
     SPEAK_DONE_DEFAULT,
     SPEAK_EXPIRED,
+    SPEAK_EXPIRED_LIVE,
     SPEAK_FAILED,
     ToolSession,
+    refresh_shown,
     retire_cards,
 )
 
@@ -206,6 +209,7 @@ class SessionManager:
         await self._discard(session)
         if session.tool_session is not None:
             session.tool_session.shown_id = None
+            retire_cards(session.tool_session.context, "cleared")
         task = session.task
         if task is None or task.done():
             return
@@ -317,35 +321,48 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
             return JSONResponse(body, status_code=e.status)
         return JSONResponse({"detail": "internal error"}, status_code=500)
 
-    def _clear_shown(live: _Session, action_id: str) -> None:
+    def _clear_shown(live: _Session, action_id: str, outcome: str) -> bool:
+        """The card `action_id` ended with `outcome` (done/denied/expired/failed). Clear the marker
+        and, when no card is left, scrub its stale traces from the model's context with outcome-specific
+        wording. Returns True when NO other card is live (so 'no card on screen' is true)."""
         ts = live.tool_session
-        if ts is not None and ts.shown_id == action_id:
+        if ts is None:
+            return True
+        if ts.shown_id == action_id:
             ts.shown_id = None
-        if ts is not None and ts.shown_id is None:
-            retire_cards(ts.context)   # no card left: scrub its stale 'on screen' traces
+            ts.last_outcome = outcome
+        if ts.shown_id is None:
+            retire_cards(ts.context, outcome)
+            return True
+        return False
 
     @app.get("/api/actions/pending")
     async def pending_actions():
         sid = sessions.current_session_id()
         if sid is None:
             return []
-        return await asyncio.to_thread(pending.list, sid)
+        cards = await asyncio.to_thread(pending.list, sid)
+        live = sessions.live_session(sid)
+        ts = live.tool_session if live is not None else None
+        if ts is not None and ts.shown_id is not None and ts.shown_id not in {c["id"] for c in cards}:
+            await refresh_shown(ts)     # the shown card timed out: clear the dead marker, scrub 'expired'
+        return cards
 
     async def _on_failure(sid: str, action_id: str, e: ActionError) -> None:
         live = sessions.live_session(sid)         # id must still match the live session
         if live is None:
             return
         if e.reason == "expired":
-            _clear_shown(live, action_id)
+            alone = _clear_shown(live, action_id, "expired")
             await sessions.push(live, {"type": "action_result", "id": action_id, "status": "expired"},
-                                speak=SPEAK_EXPIRED)
+                                speak=SPEAK_EXPIRED if alone else SPEAK_EXPIRED_LIVE)
             await sessions.push(live, {"type": "actions_cleared"})
         elif e.reason == "failed":
-            _clear_shown(live, action_id)
+            _clear_shown(live, action_id, "failed")
             await sessions.push(
                 live,
                 {"type": "action_result", "id": action_id, "status": "failed",
-                 "summary": "That did not work. Nothing was changed."},
+                 "summary": SPEAK_FAILED},
                 speak=_SPEAK_FAILED,
             )
 
@@ -364,7 +381,7 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
         summary = str(result.get("summary", ""))
         live = sessions.live_session(sid)
         if live is not None:
-            _clear_shown(live, action_id)
+            _clear_shown(live, action_id, "done")
             await sessions.push(
                 live,
                 {"type": "action_result", "id": action_id, "status": "done", "summary": summary},
@@ -384,10 +401,10 @@ def create_app(runtime: Runtime, history: History, static_dir: Path | None,
             return _error(e)
         live = sessions.live_session(sid)
         if live is not None:
-            _clear_shown(live, action_id)
+            alone = _clear_shown(live, action_id, "denied")
             await sessions.push(
                 live, {"type": "action_result", "id": action_id, "status": "denied"},
-                speak=SPEAK_DENIED,
+                speak=SPEAK_DENIED if alone else SPEAK_DENIED_LIVE,
             )
         return {"status": "denied", "id": action_id}
 

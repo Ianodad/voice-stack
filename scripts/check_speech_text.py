@@ -109,10 +109,18 @@ async def main():
         "- ": "",
         "5 * 6 * 7": "5 * 6 * 7",
         "*hi* **there** ~~you~~": "hi there you",
+        # meanings of numbers/comparisons survive; markers before letters still go
+        "> 5 servers": "> 5 servers", "- 5 degrees": "- 5 degrees", "3 *4": "3 *4",
+        "3 *4 and 5* x": "3 *4 and 5* x", "> Note this": "Note this", "* item": "item",
+        "- **Nation. Africa** x": "Nation. Africa x", "1. **Bold** y": "1. Bold y",
     }
     for src, want in cases.items():
         got = strip_markdown(src)
         assert got == want, (src, got, want)
+    import time
+    for big in ("*a " * 60000, "**a _b " * 20000, "[x " * 60000, "`" + "y " * 90000):
+        t0 = time.time(); out = strip_markdown(big); dt = time.time() - t0
+        assert dt < 1.0 and "`" not in out and "**" not in out, (big[:12], dt)   # capped: no quadratic blow-up
     print("strip_markdown unit cases ok")
 
     # ---- real service: what run_tts actually receives ----

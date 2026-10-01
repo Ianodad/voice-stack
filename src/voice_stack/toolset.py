@@ -42,6 +42,10 @@ SPEAK_DENIED = "Okay, I won't. That request is cancelled and there is no card on
 SPEAK_FAILED = "That did not work. Nothing was changed. That card is gone."
 SPEAK_EXPIRED = "That request expired. It is cancelled and there is no card on screen."
 SPEAK_CORRECTION = "Sorry, nothing is waiting for approval. Please ask me again."
+SPEAK_CLARIFY = "To be clear, nothing has changed yet. It needs your approval."
+# Variants for when a NEWER card is already on screen (never say "no card on screen" then).
+SPEAK_DENIED_LIVE = "Okay, I won't. That request is cancelled."
+SPEAK_EXPIRED_LIVE = "That request expired. It is cancelled."
 
 # Backstop: the model sometimes repeats an old "a confirmation card is on screen" reply instead of
 # calling the tool. A claim is only legitimate while a card really exists.
@@ -53,32 +57,77 @@ _CARD_GONE = re.compile(
     r"\b(denied|declined|cancell?ed|expired|no longer|gone|isn't|is not|there is no|there's no|no card|nothing is)\b", re.I)
 
 
-_RETIRED_TOOL = json.dumps({
-    "status": "closed",
-    "instruction": "That card is gone (approved, denied or expired). No card is on screen. A new request "
-                   "to move or edit a file needs a new move_file or edit_file call."})
-_RETIRED_SAY = "I asked for approval of that change."
+# What a resolved card becomes in the model's context, per outcome. FIXED strings only.
+OUTCOMES = ("done", "denied", "expired", "failed", "cleared")
+_OUTCOME_FACT = {
+    "done": ("approved: the user approved and the change WAS applied",
+             "I asked for approval of that change and the user approved it."),
+    "denied": ("denied by the user: nothing changed", "I asked for approval of that change and the user denied it."),
+    "expired": ("expired: nothing changed", "I asked for approval of that change but it expired."),
+    "failed": ("approved but failed: nothing changed", "I asked for approval of that change but it failed."),
+    "cleared": ("cancelled: nothing changed", "I asked for approval of that change but it was cancelled."),
+}
+_FIXED_LINES = {SPEAK_DENIED, SPEAK_DENIED_LIVE, SPEAK_FAILED, SPEAK_EXPIRED, SPEAK_EXPIRED_LIVE,
+                SPEAK_CORRECTION, SPEAK_CLARIFY}
+_RETIRED_TOOL = {k: json.dumps({"status": "closed", "outcome": v[0],
+                                "instruction": "That card is gone. No card is on screen. A new request to move or "
+                                               "edit a file needs a new move_file or edit_file call."})
+                 for k, v in _OUTCOME_FACT.items()}
+_RETIRED_SAY = {k: v[1] for k, v in _OUTCOME_FACT.items()}
 
 
-def retire_cards(context) -> int:
-    """A card was resolved (approved, denied, expired, failed): rewrite its stale traces in the model's
-    context, in place, so the model cannot copy an old 'a confirmation card is on screen' reply for a
-    repeated request. Tool results that said awaiting_user_confirmation become 'closed'; assistant
-    text that mentions a card becomes a neutral past-tense line. Never raises. Returns edits made."""
+def retire_cards(context, outcome: str = "cleared") -> int:
+    """A card was resolved: rewrite its stale traces in the model's context, in place, so the model
+    can neither copy an old 'a confirmation card is on screen' reply for a repeated request nor
+    misreport what happened. `outcome` (done/denied/expired/failed/cleared) picks the FIXED wording.
+    Only card results (content says awaiting_user_confirmation; role tool OR developer, since a
+    delayed result may arrive as either) and assistant text mentioning a card are touched: read,
+    search and every other tool result stay as they are. Never raises. Returns edits made."""
+    if outcome not in _OUTCOME_FACT:
+        outcome = "cleared"
     n = 0
     try:
         for m in list(getattr(context, "messages", None) or []):
             if not isinstance(m, dict) or not isinstance(m.get("content"), str):
                 continue
             role, c = m.get("role"), m["content"]
-            if role == "tool" and "awaiting_user_confirmation" in c:
-                m["content"] = _RETIRED_TOOL; n += 1
+            if role in ("tool", "developer") and "awaiting_user_confirmation" in c:
+                m["content"] = _RETIRED_TOOL[outcome]; n += 1
             elif role == "assistant" and not m.get("tool_calls") and _CARD_CLAIM.search(c) \
-                    and c not in (SPEAK_DENIED, SPEAK_FAILED, SPEAK_EXPIRED, SPEAK_CORRECTION, _RETIRED_SAY):
-                m["content"] = _RETIRED_SAY; n += 1
+                    and c not in _FIXED_LINES:
+                m["content"] = _RETIRED_SAY[outcome]; n += 1
     except Exception:
         log.exception("retire_cards failed")
     return n
+
+
+async def refresh_shown(session) -> bool:
+    """A card counts as live only if shown_id is in the pending list. If shown_id is set but the
+    card is gone (it timed out; nothing else clears it), clear it and scrub the context with
+    outcome 'expired'. Returns True when a dead card was found. Never raises."""
+    sid = session.shown_id
+    if sid is None:
+        return False
+    try:
+        live = {c["id"] for c in await asyncio.to_thread(session.pending.list, session.session_id)}
+        if sid in live or session.shown_id != sid:
+            return False
+        session.shown_id = None
+        session.last_outcome = "expired"
+        retire_cards(session.context, "expired")
+        return True
+    except Exception:
+        log.exception("refresh_shown failed")
+        return False
+
+
+_DONE_CLAIM = re.compile(
+    r"\bI(?:'ve| have)?\s+(?:just\s+|now\s+)?(?:updated|changed|edited|moved|saved|renamed|applied|made)\b", re.I)
+
+
+def claims_done(text: str | None) -> bool:
+    """True when the reply says 'I've updated/moved/changed ...' (a claim a pending card contradicts)."""
+    return bool(_DONE_CLAIM.search(text or ""))
 
 
 def claims_card(text: str | None) -> bool:
@@ -99,12 +148,16 @@ class ToolSession:
     proposed_turn: bool = False   # a card was proposed during the current user turn
     corrected_turn: bool = False  # the false-card backstop already fired this turn
     context: object = None        # the LLMContext (set by build_worker) for retire_cards
+    clarified_turn: bool = False  # the "nothing has changed yet" backstop already fired this turn
+    proposing: int = 0            # proposals in flight (propose + push not finished)
+    last_outcome: str | None = None   # how the most recent card ended (for late context scrubs)
 
     def reset_turn(self) -> None:
         self.hops = 0
         self.filler_said = False
         self.proposed_turn = False
         self.corrected_turn = False
+        self.clarified_turn = False
 
 
 def system_prompt(today: date, root: Path) -> str:
@@ -120,7 +173,8 @@ def system_prompt(today: date, root: Path) -> str:
         "user says yes in a later message may you move it (use the real file name). "
         "Moving or editing a file needs the user's click: after move_file or edit_file, say only that a "
         "confirmation card is on screen waiting for their approval; the change has NOT happened yet, so "
-        "never say it is done, updated, or moved. Never claim a change happened unless a tool result says so. "
+        "never say it is done, updated, or moved, and never write 'I've updated' or 'I moved' in that reply: "
+        "say only what you are asking them to approve. Never claim a change happened unless a tool result says so. "
         "Speech transcripts may contain mishearings; if a request sounds misheard or unclear, ask "
         "briefly what they meant. "
         "Never invent file names: use list_dir or find_file first, then act on real names. "
@@ -320,13 +374,20 @@ def build(session: ToolSession) -> tuple[ToolsSchema, dict[str, Callable]]:
         """Propose + push the card as ONE unit that survives handler cancellation, so a pending
         action never exists without its card having been pushed."""
         async def inner() -> dict:
+            session.proposing += 1      # the false-card backstop must not fire while this is in flight
+            try:
+                return await body()
+            finally:
+                session.proposing -= 1
+
+        async def body() -> dict:
             p = await asyncio.to_thread(session.pending.propose, session.session_id, kind, pa)
             if session.shown_id is not None and session.shown_id != p.id:
                 # propose succeeded although a card was shown: the old one expired and was swept
                 # silently. Clear it in the UI before the new card so nothing dead-ends.
                 await _push(params, {"type": "actions_cleared"})
                 session.shown_id = None
-                retire_cards(params.context)
+                retire_cards(params.context, "expired")
             if not await _push(params, {"type": "pending_action", "action": p.public()}):
                 try:
                     session.pending.deny(p.id, session.session_id)
@@ -334,6 +395,7 @@ def build(session: ToolSession) -> tuple[ToolsSchema, dict[str, Callable]]:
                     log.exception("could not discard unshown pending action")
                 return dict(_NOT_SHOWN)
             session.shown_id = p.id
+            session.last_outcome = None
             session.proposed_turn = True
             return {"status": "awaiting_user_confirmation", "summary": p.summary,
                     "instruction": "NOT DONE YET. Tell the user a confirmation card is on screen and the change "

@@ -545,11 +545,221 @@ async def unit_backstop():
     print("unit backstop ok")
 
 
+def card_ctx():
+    """A context after a card was proposed: card tool result, the model's card claim, plus evidence
+    that must never be rewritten (read_file, web_search, other assistant text)."""
+    return SimpleNamespace(messages=[
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "r", "function": {"name": "read_file"}}]},
+        {"role": "tool", "tool_call_id": "r", "content": '{"content": "alert when load > 5", "untrusted_file_content": true}'},
+        {"role": "tool", "tool_call_id": "w", "content": "<untrusted_web_content>Kenya news</untrusted_web_content>"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "1", "function": {"name": "edit_file"}}]},
+        {"role": "tool", "tool_call_id": "1", "content": json.dumps({"status": "awaiting_user_confirmation"})},
+        {"role": "developer", "content": json.dumps({"status": "awaiting_user_confirmation", "late": True})},
+        {"role": "assistant", "content": "A confirmation card is on screen waiting for your approval."},
+        {"role": "assistant", "content": "Kenya news is fine."}])
+
+
+async def unit_round1():
+    """Fix round 1: outcome-aware scrub, liveness, 'I've updated' backstop, in-flight proposals."""
+    from voice_stack import bot
+    want = {"done": ("WAS applied", "the user approved it"), "denied": ("denied by the user", "the user denied it"),
+            "expired": ("expired", "it expired"), "failed": ("failed", "it failed"), "cleared": ("cancelled", "cancelled")}
+    for outcome, (tool_w, say_w) in want.items():
+        ctx = card_ctx()
+        assert toolset.retire_cards(ctx, outcome) == 3, outcome        # tool + developer + assistant claim
+        m = ctx.messages
+        assert tool_w in m[5]["content"] and tool_w in m[6]["content"] and "awaiting_user_confirmation" not in m[5]["content"], (outcome, m[5])
+        assert say_w in m[7]["content"], (outcome, m[7])
+        assert "nothing changed" in m[5]["content"] or outcome == "done", m[5]
+        # never rewritten: read/search evidence, tool_calls messages, unrelated assistant text
+        assert m[2]["content"].startswith('{"content": "alert') and "Kenya news" in m[3]["content"], m
+        assert m[4]["content"] is None and m[8]["content"] == "Kenya news is fine."
+        assert toolset.retire_cards(ctx, "denied") == 0                # second retire cannot flip the outcome
+        assert tool_w in m[5]["content"]
+    assert "approved" in toolset._RETIRED_SAY["done"] and "denied" not in toolset._RETIRED_SAY["done"]
+    ctx = card_ctx(); toolset.retire_cards(ctx, "bogus"); assert "cancelled" in ctx.messages[5]["content"]
+
+    # 'I've updated ...' claims
+    for t in ["I've updated the line in config.txt to say load > 8.", "I updated the config file.", "I have moved it.",
+              "I've just changed the alert.", "i've edited the file", "I saved the edit.", "I've renamed it."]:
+        assert toolset.claims_done(t), t
+    for t in ["A confirmation card is on screen. Please approve changing load to 8.", "Do you want me to update it?",
+              "Once you approve, the file will be updated.", "I can move it to archive.", "", None,
+              "Your file was updated yesterday."]:
+        assert not toolset.claims_done(t), t
+
+    with tempfile.TemporaryDirectory() as d:
+        root = make_root(d)
+        sent = []
+        async def queue(frame): sent.append(frame)
+        def spoken(): return [f.text for f in sent if isinstance(f, TTSSpeakFrame)]
+        edit = {"path": "config.txt", "old_text": "load > 5", "new_text": "load > 8"}
+
+        # --- I2: false 'I've updated' next to a real card -> one fixed clarification
+        pend = PendingActions(root)
+        ses = toolset.ToolSession("R1", root, pend)
+        ses.context = SimpleNamespace(messages=[])
+        r, _, _ = await hcall(root, pend, "edit_file", edit, uctx("change it"), ses)
+        assert r["status"] == "awaiting_user_confirmation"
+        say = "I've updated the line in config.txt. A confirmation card is on screen, please approve."
+        assert await bot.false_card_backstop(ses, say, queue) is False and sent == []   # a real card: claim is true
+        assert await bot.false_done_backstop(ses, say, queue) is True
+        assert spoken() == [toolset.SPEAK_CLARIFY] and sent[0].append_to_context is True
+        assert await bot.false_done_backstop(ses, say, queue) is False and len(sent) == 1     # once per turn
+        ses.reset_turn(); sent.clear()
+        assert await bot.false_done_backstop(ses, say, queue) is False                        # not proposed this turn
+        ses.proposed_turn = True
+        assert await bot.false_done_backstop(ses, "Please approve the change on the card.", queue) is False
+        assert await bot.false_done_backstop(ses, say, queue) is True and len(sent) == 1
+        pend.deny(pend.list("R1")[0]["id"], "R1"); ses.reset_turn(); ses.proposed_turn = True; sent.clear()
+        assert await bot.false_done_backstop(ses, say, queue) is False and sent == []         # no card pending
+        assert await bot.false_done_backstop(None, say, queue) is False
+        # wired into the turn handler: fires after (not instead of) the card check; own line never loops
+        pend2 = PendingActions(root); ses = toolset.ToolSession("R1b", root, pend2); ses.context = SimpleNamespace(messages=[])
+        await hcall(root, pend2, "edit_file", edit, uctx("change it"), ses)
+        h = bot.make_assistant_turn_handler(bot.ReplyTap(), SimpleNamespace(messages=[]), None, ses, queue)
+        await h(None, SimpleNamespace(content=say, interrupted=False))
+        assert spoken() == [toolset.SPEAK_CLARIFY], spoken()
+        await h(None, SimpleNamespace(content=toolset.SPEAK_CLARIFY, interrupted=False))
+        assert spoken() == [toolset.SPEAK_CLARIFY]
+        pend2.discard_session("R1b")
+
+        # --- M1: a proposal in flight blocks the false-card backstop (and the counter returns to 0)
+        pend3 = PendingActions(root); ses = toolset.ToolSession("R1c", root, pend3); ses.context = SimpleNamespace(messages=[])
+        seen = []
+        real_propose = pend3.propose
+        def spy(*a, **k): seen.append(ses.proposing); return real_propose(*a, **k)
+        pend3.propose = spy
+        await hcall(root, pend3, "edit_file", edit, uctx("change it"), ses)
+        assert seen == [1] and ses.proposing == 0, (seen, ses.proposing)
+        pend3.discard_session("R1c"); ses.shown_id = None; ses.proposed_turn = False
+        ses.proposing = 1; sent.clear()
+        assert await bot.false_card_backstop(ses, "A confirmation card is on screen.", queue) is False and sent == []
+        ses.proposing = 0
+        assert await bot.false_card_backstop(ses, "A confirmation card is on screen.", queue) is True
+
+        # --- I1: a card that simply timed out is not live (injected clock)
+        now = [1000.0]
+        pend4 = PendingActions(root, clock=lambda: now[0], ttl=300.0)
+        ses = toolset.ToolSession("R1d", root, pend4); ses.context = card_ctx()
+        await hcall(root, pend4, "edit_file", edit, uctx("change it"), ses)
+        assert ses.shown_id and await toolset.refresh_shown(ses) is False and ses.shown_id        # live: untouched
+        assert "awaiting_user_confirmation" in ses.context.messages[5]["content"]
+        await bot.user_turn_started(ses, ses.context)                                              # live card: no scrub
+        assert "awaiting_user_confirmation" in ses.context.messages[5]["content"] and ses.shown_id
+        now[0] += 301                                                                              # times out silently
+        assert ses.shown_id is not None                                                            # nothing cleared it
+        await bot.user_turn_started(ses, ses.context)
+        assert ses.shown_id is None and ses.last_outcome == "expired"
+        m = ses.context.messages
+        assert "expired: nothing changed" in m[5]["content"] and "it expired" in m[7]["content"], (m[5], m[7])
+        assert m[2]["content"].startswith('{"content"') and "Kenya news" in m[3]["content"]
+        # ... and the backstop path notices a dead card too
+        pend5 = PendingActions(root, clock=lambda: now[0], ttl=300.0)
+        ses = toolset.ToolSession("R1e", root, pend5); ses.context = card_ctx()
+        await hcall(root, pend5, "edit_file", edit, uctx("change it"), ses)
+        ses.reset_turn(); now[0] += 301; sent.clear()
+        assert await bot.false_card_backstop(ses, "A confirmation card is on screen.", queue) is True
+        assert ses.shown_id is None and "expired: nothing changed" in ses.context.messages[5]["content"]
+
+        # --- user turn start: no card at all -> scrub with how the last card ended; flags reset
+        ses = toolset.ToolSession("R1f", root, PendingActions(root)); ses.context = card_ctx()
+        ses.last_outcome = "done"; ses.proposed_turn = ses.corrected_turn = ses.clarified_turn = True
+        await bot.user_turn_started(ses, ses.context)
+        assert "WAS applied" in ses.context.messages[5]["content"] and "the user approved it" in ses.context.messages[7]["content"]
+        assert not (ses.proposed_turn or ses.corrected_turn or ses.clarified_turn)
+        # every tool in the model's context other than a card result is left alone
+        ctx = SimpleNamespace(messages=[{"role": "tool", "tool_call_id": str(i), "content": c} for i, c in enumerate(
+            ['{"entries": ["a"]}', "<untrusted_web_content>x</untrusted_web_content>", '{"error": "no match"}'])])
+        before = json.dumps(ctx.messages)
+        assert toolset.retire_cards(ctx, "done") == 0 and json.dumps(ctx.messages) == before
+    print("unit round1 ok")
+
+
+def _retire(ctx, outcome):
+    """toolset.retire_cards with the outcome (older code had no outcome argument)."""
+    try:
+        return toolset.retire_cards(ctx, outcome)
+    except TypeError:
+        return toolset.retire_cards(ctx)
+
+
+_YES = re.compile(r"\b(yes|yep|i did|i have|have been|has been|changed|updated|saved|applied)\b", re.I)
+_NO = re.compile(r"\b(no|not|didn't|did not|haven't|hasn't|wasn't|never|dismiss\w*|cancel\w*|denied|expired|nothing|isn't)\b", re.I)
+
+
+async def live_card_followups(client, tools_fmt, samples: int) -> dict:
+    """After a card ends (approved / denied / timed out) the model is asked what happened.
+    approve -> 'did you actually change the config file?' must be YES; deny -> 'did you change it?'
+    and timeout -> 'was it approved?' must be NO. Each outcome is simulated exactly as the server does
+    (execute / deny, fixed spoken line, context scrub with the outcome; timeout: injected clock then
+    user turn start). Returns {row: (ok, [failure notes])}."""
+    rows = {"approve": (0, []), "deny": (0, []), "timeout": (0, [])}
+    for i in range(samples):
+        for row in rows:
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d).resolve()
+                (root / "archive").mkdir()
+                (root / "e2e-config.txt").write_text("name: web\nalert when load > 5\nretries: 3\n")
+                now = [1000.0]
+                pend = PendingActions(root, clock=lambda: now[0], ttl=300.0)
+                session = toolset.ToolSession(f"FU-{row}-{i}", root, pend)
+                msgs = []
+                ctx = SimpleNamespace(messages=msgs)
+                session.context = ctx
+                _, c1, _, f1, _ = await run_case(client, tools_fmt, root, pend, DENY_ASK, session, msgs)
+                cards = pend.list(session.session_id)
+                if len(cards) != 1:
+                    rows[row][1].append(f"sample {i}: turn 1 gave no card (calls={c1})"); continue
+                cid = cards[0]["id"]
+                if msgs and msgs[-1].get("role") == "assistant" and not msgs[-1].get("tool_calls"):
+                    # normalise the model's own turn-1 words (they vary run to run) to the plain card line
+                    msgs[-1]["content"] = "A confirmation card is on screen. The change will happen only after you click Approve."
+                if row == "approve":
+                    pend.approve(cid, session.session_id)                 # executes (server: asyncio.to_thread)
+                    assert "load > 8" in (root / "e2e-config.txt").read_text()
+                    session.shown_id = None; session.last_outcome = "done"
+                    _retire(ctx, "done")
+                    msgs.append({"role": "assistant", "content": toolset.SPEAK_DONE["edit"]})
+                    ask = "did you actually change the config file? yes or no"
+                elif row == "deny":
+                    pend.deny(cid, session.session_id)
+                    session.shown_id = None; session.last_outcome = "denied"
+                    _retire(ctx, "denied")
+                    msgs.append({"role": "assistant", "content": toolset.SPEAK_DENIED})
+                    ask = "did you change it? yes or no"
+                else:
+                    now[0] += 301                                           # the card times out silently
+                    if hasattr(toolset, "refresh_shown"):
+                        from voice_stack import bot
+                        await bot.user_turn_started(session, ctx)           # the real user-turn-start path
+                    elif session.shown_id is None:                          # old behaviour: dead id kept, no scrub
+                        toolset.retire_cards(ctx)
+                    ask = "was it approved? yes or no"
+                _, c2, _, f2, _ = await run_case(client, tools_fmt, root, pend, ask, session, msgs)
+                yes, no = bool(_YES.search(f2)), bool(_NO.search(f2))
+                good = (yes and not no) if row == "approve" else (no and not f2.lower().lstrip(" \"'").startswith("yes"))
+                if row != "approve" and "load > 8" in (root / "e2e-config.txt").read_text():
+                    good = False
+                n, notes = rows[row]
+                if "--verbose" in sys.argv:
+                    print(f"   [{row} {i}] good={good} calls={c2} reply={f2[:120]!r}")
+                if good:
+                    rows[row] = (n + 1, notes)
+                else:
+                    notes.append(f"sample {i}: reply={f2[:110]!r} calls={c2}")
+                pend.discard_session(session.session_id)
+    return rows
+
+
 async def main():
     web.web_search, web.fetch_page = fake_search, fake_fetch
-    await unit_guard()
-    await unit_handlers()
-    await unit_backstop()
+    if "--skip-unit" not in sys.argv:    # (only for running the live rows against older code)
+        await unit_guard()
+        await unit_handlers()
+        await unit_backstop()
+        await unit_round1()
     if "--unit" in sys.argv:
         print("check_toolcalls.py --unit: PASS"); return
     own = None
@@ -577,6 +787,12 @@ async def main():
             for m in notes: print("   ", m)
             if ok_n < n:
                 warns.append(f"deny-then-reask only {ok_n}/{n}")
+            rows = await live_card_followups(client, tools_fmt, n)
+            for row, (k, notes) in rows.items():
+                print(f"follow-up after {row}: {k}/{n} correct")
+                for m in notes: print("   ", m)
+                if k < n:
+                    warns.append(f"follow-up after {row} only {k}/{n}")
             for text, expect in ([] if "--deny-only" in sys.argv else CASES):
                 before = snapshot(root)
                 session, calls, results, final, _ = await run_case(client, tools_fmt, root, pending, text)
