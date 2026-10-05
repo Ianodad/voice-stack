@@ -32,6 +32,7 @@ from voice_stack.runtime import (
 )
 from voice_stack.stt import ParakeetSTTService
 from voice_stack.tts import MLXKokoroTTSService
+from voice_stack.wake import WakeGate
 
 
 class ReplyTap(FrameProcessor):
@@ -237,8 +238,9 @@ def build_worker(
             if message.content and message.content.strip():
                 on_turn("user", message.content)
 
+    wake_gate = WakeGate()
     pipeline = Pipeline(
-        [transport.input(), stt, user_agg, llm, reply_tap, tts, transport.output(), assistant_agg]
+        [transport.input(), stt, wake_gate, user_agg, llm, reply_tap, tts, transport.output(), assistant_agg]
     )
     worker = PipelineWorker(
         pipeline,
