@@ -26,6 +26,7 @@ from voice_stack.fence import CUES, LOCAL_CODE_CUE, print_code_block
 from voice_stack.runtime import (
     STT_MODEL_ID,
     TTS_LANG_CODE,
+    TTS_CLONE_KWARGS,
     TTS_MODEL_ID,
     TTS_VOICE,
     Runtime,
@@ -183,6 +184,7 @@ def build_worker(
         voice=TTS_VOICE,
         lang_code=TTS_LANG_CODE,
         model=runtime.tts_model,
+        **TTS_CLONE_KWARGS,
         **({"code_cue": LOCAL_CODE_CUE, "on_code": print_code_block} if terminal_code else {}),
     )
     if tools is None:

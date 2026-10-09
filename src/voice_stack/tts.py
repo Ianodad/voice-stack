@@ -40,6 +40,8 @@ class MLXKokoroTTSService(TTSService):
         voice: str = "af_heart",
         lang_code: str = "a",
         speed: float = 1.0,
+        ref_audio: str | None = None,
+        ref_text: str | None = None,
         model=None,
         code_cue: str | None = CODE_CUE,
         on_code=None,
@@ -72,6 +74,9 @@ class MLXKokoroTTSService(TTSService):
         self._voice = voice
         self._lang_code = lang_code
         self._speed = speed
+        # Voice clone (e.g. pocket-tts): reference clip instead of a named voice.
+        self._ref_audio = ref_audio
+        self._ref_text = ref_text
         # A preloaded `model` skips loading. Otherwise it is loaded on the
         # shared MLX executor thread, not the caller's thread.
         self._model = model if model is not None else executor.submit(load_model, model_id).result()
@@ -88,9 +93,14 @@ class MLXKokoroTTSService(TTSService):
         # sentence-internal chunk). Step it one chunk at a time on the shared
         # MLX executor thread so audio streams out as each chunk is ready,
         # instead of blocking until the whole sentence is synthesized.
-        chunks = self._model.generate(
-            text=text, voice=self._voice, speed=self._speed, lang_code=self._lang_code
-        )
+        if self._ref_audio:
+            chunks = self._model.generate(
+                text=text, ref_audio=self._ref_audio, ref_text=self._ref_text, stream=True
+            )
+        else:
+            chunks = self._model.generate(
+                text=text, voice=self._voice, speed=self._speed, lang_code=self._lang_code
+            )
         sentinel = object()
 
         def _next_chunk():

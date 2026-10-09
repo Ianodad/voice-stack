@@ -7,6 +7,7 @@ one Runtime (see bot.build_worker) so models load once per process.
 """
 
 import asyncio
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -29,6 +30,18 @@ LLM_MODEL_ID = "mlx-community/Qwen3.6-35B-A3B-4bit"
 TTS_MODEL_ID = "mlx-community/Kokoro-82M-bf16"
 TTS_VOICE = "af_heart"
 TTS_LANG_CODE = "a"
+# Optional voice clone: VOICE_STACK_CLONE_REF=/path/ref.wav (transcript in /path/ref.txt, next to it).
+# Switches TTS to pocket-tts, which clones from the clip. Unset = Kokoro.
+_CLONE_REF = os.environ.get("VOICE_STACK_CLONE_REF")
+if _CLONE_REF:
+    TTS_MODEL_ID = "mlx-community/pocket-tts"
+    _ref = Path(_CLONE_REF).expanduser()
+    TTS_CLONE_KWARGS = {
+        "ref_audio": str(_ref),
+        "ref_text": _ref.with_suffix(".txt").read_text().strip(),
+    }
+else:
+    TTS_CLONE_KWARGS = {}
 
 LLM_HOST = "127.0.0.1"
 LLM_PORT = 8080
@@ -189,6 +202,7 @@ class Runtime:
             model_id=TTS_MODEL_ID,
             voice=TTS_VOICE,
             lang_code=TTS_LANG_CODE,
+            **TTS_CLONE_KWARGS,
         )
         print(f"  loaded in {time.perf_counter() - t0:.2f}s")
         self.stt_model = stt._model
